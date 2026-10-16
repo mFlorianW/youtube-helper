@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+#
+# SPDX-License-Identifier: GPL-2.0-only
+
+# Example deployment of youtube-helper as its own compose project.
+#
+# Before the first start:
+# - create the host directories for the Media library and the state, writable by the
+#   user below (the tool never changes ownership or permissions);
+# - put the Google OAuth client ID and secret into the two secret files.
+
+name: youtube-helper
+
+services:
+  youtube-helper:
+    image: ghcr.io/mflorianw/youtube-helper:latest
+    restart: unless-stopped
+    # The user that owns the Media library and state directories on the host.
+    user: "1000:1000"
+    environment:
+      MEDIA_LIBRARY: /media-library
+      TZ: Europe/Berlin
+    volumes:
+      - /srv/media/youtube:/media-library:rw
+      - /srv/youtube-helper/state:/state:rw
+    secrets:
+      - google_client_id
+      - google_client_secret
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  google_client_id:
+    file: ./secrets/google_client_id
+  google_client_secret:
+    file: ./secrets/google_client_secret
