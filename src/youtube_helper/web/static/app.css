@@ -1,0 +1,121 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+ *
+ * SPDX-License-Identifier: GPL-2.0-only
+ */
+
+/* youtube-helper's own touches on top of Pico.css. */
+
+button {
+  white-space: nowrap;
+}
+
+body > header {
+  padding-block: 2rem 0.5rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+}
+
+.count {
+  margin-left: 0.25rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: var(--pico-muted-border-color);
+  font-size: 0.8rem;
+  vertical-align: middle;
+}
+
+.notice {
+  color: var(--pico-muted-color);
+}
+
+.notice.error {
+  color: var(--pico-del-color);
+}
+
+.channels {
+  padding: 0;
+}
+
+.channels .channel {
+  list-style: none;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.5rem;
+  border-radius: var(--pico-border-radius);
+  background: var(--pico-card-background-color);
+  box-shadow: var(--pico-card-box-shadow);
+}
+
+.channel {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.channel .details {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.channel .details a {
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.channel .details small {
+  color: var(--pico-muted-color);
+}
+
+.channel .description {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.channel form {
+  margin: 0;
+}
+
+.channel button {
+  margin: 0;
+  padding: 0.4rem 0.9rem;
+}
+
+.preview {
+  margin-top: 1rem;
+}
+
+.avatar {
+  flex: none;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.avatar.placeholder {
+  display: grid;
+  place-items: center;
+  background: var(--pico-primary-background);
+  color: var(--pico-primary-inverse);
+  font-weight: 700;
+}
+
+.badge {
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  background: var(--pico-muted-border-color);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+@media (max-width: 576px) {
+  .channel {
+    flex-wrap: wrap;
+  }
+}

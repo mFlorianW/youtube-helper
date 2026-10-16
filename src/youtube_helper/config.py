@@ -10,6 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_STATE_DIR = Path("/state")
+DEFAULT_WEB_PORT = 8080
 
 
 class ConfigError(Exception):
@@ -21,6 +22,7 @@ class Config:
     media_library: Path
     state_dir: Path
     timezone: ZoneInfo
+    web_port: int
 
 
 def load_config(environ: Mapping[str, str]) -> Config:
@@ -32,9 +34,12 @@ def load_config(environ: Mapping[str, str]) -> Config:
         timezone = ZoneInfo(timezone_name)
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise ConfigError(f"TZ {timezone_name!r} is not a known time zone") from error
-    return Config(Path(media_library), load_state_dir(environ), timezone)
+    state_dir = Path(environ.get("STATE_DIR") or DEFAULT_STATE_DIR)
+    return Config(Path(media_library), state_dir, timezone, _web_port(environ))
 
 
-def load_state_dir(environ: Mapping[str, str]) -> Path:
-    """The state directory alone, for commands that need nothing else from the config."""
-    return Path(environ.get("STATE_DIR") or DEFAULT_STATE_DIR)
+def _web_port(environ: Mapping[str, str]) -> int:
+    value = environ.get("WEB_PORT") or str(DEFAULT_WEB_PORT)
+    if not value.isdigit() or not 1 <= int(value) <= 65535:
+        raise ConfigError(f"WEB_PORT {value!r} is not a port number (1-65535)")
+    return int(value)

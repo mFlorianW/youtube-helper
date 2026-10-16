@@ -2,28 +2,14 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-# Example deployment of youtube-helper as a Docker Swarm stack, for keeping the Google
-# OAuth client ID and secret in Swarm's encrypted secret store instead of host files.
-# Without Swarm, use compose.yaml next to this file; settings not explained here are
+# Example deployment of youtube-helper as a Docker Swarm stack, for hosts that run a swarm
+# anyway. Without Swarm, use compose.yaml next to this file; settings not explained here are
 # explained there.
 #
-# Swarm stores secrets encrypted in its Raft log and only hands them to the containers
-# that use them. youtube-helper reads them from /run/secrets/<name> either way, so the
-# image is the same for both deployments.
-#
-# One-time setup on the (single-node) swarm:
-#   docker swarm init
-#   printf '%s' '<client id>' | docker secret create google_client_id -
-#   printf '%s' '<client secret>' | docker secret create google_client_secret -
 # Deploy and follow the logs:
 #   docker stack deploy -c stack.yaml youtube-helper
 #   docker service logs -f youtube-helper_youtube-helper
-# Log in once (see "Logging in" in the README). The secrets are only available to the
-# service's own container, so run `login` inside it:
-#   docker exec -it $(docker ps -q -f name=youtube-helper_youtube-helper) youtube-helper login
-#
-# A Swarm secret can't be changed in place. To replace one, remove the stack (or the
-# secret from the service), `docker secret rm` it, create it again and redeploy.
+# Then open the web UI (see `ports:`) and add the channels to follow.
 
 services:
   youtube-helper:
@@ -34,6 +20,11 @@ services:
       MEDIA_LIBRARY: /media-library
       # adjust: your local time zone (IANA name).
       TZ: Europe/Berlin
+    # adjust: the host port of the web UI. It has no login of its own: keep it inside your
+    # LAN, or put a reverse proxy with authentication in front.
+    ports:
+      - target: 8080
+        published: 8080
     # Bind mounts refer to directories on the node running the task. They must already
     # exist there, which is why the service is pinned to the manager node below.
     volumes:
@@ -45,19 +36,6 @@ services:
       - type: bind
         source: /srv/youtube-helper/state
         target: /state
-    # Long syntax: unlike plain Compose, Swarm sets owner and mode of the secret file in
-    # the container, so the host needs no secret files at all.
-    secrets:
-      - source: google_client_id
-        target: google_client_id
-        uid: "1000"
-        gid: "1000"
-        mode: 0400
-      - source: google_client_secret
-        target: google_client_secret
-        uid: "1000"
-        gid: "1000"
-        mode: 0400
     logging:
       driver: json-file
       options:
@@ -72,10 +50,3 @@ services:
       placement:
         constraints:
           - node.role == manager
-
-# Created beforehand with `docker secret create` (see above).
-secrets:
-  google_client_id:
-    external: true
-  google_client_secret:
-    external: true

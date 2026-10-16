@@ -1,0 +1,27 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+<h2>Subscriptions <small class="count">{{ subscriptions | length }}</small></h2>
+{% if not subscriptions %}
+<p class="notice">No Subscriptions yet. Add a channel above and its New uploads land in the Media library.</p>
+{% else %}
+<ul class="channels">
+  {% for subscription in subscriptions %}
+  <li class="channel">
+    {% with avatar_url=subscription.avatar_url, name=subscription.display_name %}{% include "_avatar.html" %}{% endwith %}
+    <div class="details">
+      <a href="https://www.youtube.com/channel/{{ subscription.channel_id }}" target="_blank" rel="noopener noreferrer"><span class="channel-name">{{ subscription.display_name }}</span></a>
+      <small>Tracking since {{ subscription.tracking_start | local_time }}</small>
+    </div>
+    <form method="post" action="/subscriptions/{{ subscription.channel_id }}/remove"
+          hx-post="/subscriptions/{{ subscription.channel_id }}/remove" hx-target="#subscriptions"
+          hx-confirm="Remove {{ subscription.display_name }}? Its videos stay in the Media library.">
+      <button type="submit" class="secondary outline">Remove</button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}

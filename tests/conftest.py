@@ -25,15 +25,6 @@ def state_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def secrets_dir(tmp_path: Path) -> Path:
-    directory = tmp_path / "secrets"
-    directory.mkdir()
-    (directory / "google_client_id").write_text("client-id.apps.googleusercontent.com\n")
-    (directory / "google_client_secret").write_text("client-secret\n")
-    return directory
-
-
-@pytest.fixture
 def state(state_dir: Path) -> Iterator[StateStore]:
     store = StateStore.open(state_dir)
     yield store

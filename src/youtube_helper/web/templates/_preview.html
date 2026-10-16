@@ -1,0 +1,26 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+{% if error %}
+<p class="notice error" role="alert">{{ error }}</p>
+{% elif channel %}
+<div class="channel preview">
+  {% with avatar_url=channel.avatar_url, name=channel.display_name %}{% include "_avatar.html" %}{% endwith %}
+  <div class="details">
+    <strong>{{ channel.display_name }}</strong>
+    {% if channel.description %}<small class="description">{{ channel.description | truncate(240) }}</small>{% endif %}
+  </div>
+  {% if already %}
+  <span class="badge">Already subscribed</span>
+  {% else %}
+  <form method="post" action="/subscriptions"
+        hx-post="/subscriptions" hx-target="#subscriptions" hx-disabled-elt="find button">
+    <input type="hidden" name="channel_id" value="{{ channel.channel_id }}">
+    <button type="submit">Subscribe</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}

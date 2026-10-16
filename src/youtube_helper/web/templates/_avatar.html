@@ -1,0 +1,11 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+{% if avatar_url %}
+<img class="avatar" src="{{ avatar_url }}" alt="" loading="lazy" referrerpolicy="no-referrer">
+{% else %}
+<span class="avatar placeholder" aria-hidden="true">{{ name[:1] | upper }}</span>
+{% endif %}

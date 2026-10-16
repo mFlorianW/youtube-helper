@@ -27,4 +27,6 @@ COPY --from=deno /deno /usr/local/bin/deno
 COPY --from=build /app/.venv /app/.venv
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1
+# The web UI (WEB_PORT).
+EXPOSE 8080
 ENTRYPOINT ["youtube-helper"]

@@ -5,12 +5,16 @@
 """The SQLite state store that keeps all tool state in one file under the state directory."""
 
 import sqlite3
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
+from youtube_helper.channels import Channel
 from youtube_helper.media_library import channel_folder
 from youtube_helper.upload_feed import Upload
 
@@ -55,6 +59,9 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     " PRIMARY KEY (channel_id, season))",
     "ALTER TABLE subscription ADD COLUMN description TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE subscription ADD COLUMN avatar_url TEXT",
+    # The owner's Google login is gone with Google: the Subscriptions are the tool's own now.
+    "DROP TABLE login",
+    "ALTER TABLE subscription ADD COLUMN details_refreshed TEXT",
 )
 
 
@@ -68,7 +75,8 @@ class TrackedSubscription:
     """A Subscription as the tool knows it: inactive once the owner has unsubscribed.
 
     The display name and the Channel folder are the ones from first sight; later renames don't
-    change them. The description and avatar URL are the ones last seen.
+    change them. The description and avatar URL are the ones last seen, at `details_refreshed`
+    (None if not since the Subscriptions came from the Google account).
     """
 
     channel_id: str
@@ -78,22 +86,38 @@ class TrackedSubscription:
     tracking_start: datetime
     description: str
     avatar_url: str | None
+    details_refreshed: datetime | None
 
     def tracks(self, upload: Upload) -> bool:
         """Whether `upload` is a New upload: released after the current tracking start."""
         return upload.released > self.tracking_start
 
 
+class Subscribed(Enum):
+    STARTED = "Started"
+    RESTARTED = "Restarted"
+    ALREADY_ACTIVE = "Already tracking"
+
+
 class StateStore:
+    """Shared by the daemon's threads: each method runs alone, in a transaction of its own."""
+
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        # Reads end their transaction too, so none stays open while the caller downloads.
+        with self._lock, self._connection:
+            yield self._connection
 
     @classmethod
     def open(cls, state_dir: Path) -> Self:
         """Open the state database in `state_dir`, creating or upgrading it as needed."""
         path = state_dir / DATABASE_NAME
         try:
-            connection = sqlite3.connect(path, autocommit=False)
+            connection = sqlite3.connect(path, autocommit=False, check_same_thread=False)
             _migrate(connection)
         except sqlite3.Error as error:
             raise StateUnavailable(path, error) from error
@@ -102,73 +126,95 @@ class StateStore:
     def close(self) -> None:
         self._connection.close()
 
-    def refresh_token(self) -> str | None:
-        """The owner's OAuth refresh token, or None until `login` has been run."""
-        row = self._connection.execute("SELECT refresh_token FROM login").fetchone()
-        return None if row is None else str(row[0])
-
-    def save_refresh_token(self, refresh_token: str) -> None:
-        """Store the owner's OAuth refresh token, replacing any earlier one."""
-        with self._connection:
-            self._connection.execute(
-                "INSERT INTO login (id, refresh_token) VALUES (1, ?)"
-                " ON CONFLICT (id) DO UPDATE SET refresh_token = excluded.refresh_token",
-                (refresh_token,),
-            )
-
     def tracked_subscriptions(self) -> list[TrackedSubscription]:
-        """Every Subscription ever seen, active or not, in the order first seen."""
-        rows = self._connection.execute(
-            "SELECT channel_id, display_name, channel_folder, active, tracking_start,"
-            " description, avatar_url"
-            " FROM subscription ORDER BY rowid"
-        )
-        return [
-            TrackedSubscription(
-                channel_id,
-                display_name,
-                folder,
-                bool(active),
-                datetime.fromisoformat(start),
-                description,
-                avatar_url,
-            )
-            for channel_id, display_name, folder, active, start, description, avatar_url in rows
-        ]
+        """Every Subscription ever made, active or not, in the order first made."""
+        with self._transaction() as connection:
+            rows = connection.execute(_SELECT_SUBSCRIPTION + " ORDER BY rowid").fetchall()
+        return [_tracked(row) for row in rows]
 
-    def save_tracked_subscriptions(self, subscriptions: Iterable[TrackedSubscription]) -> None:
-        """Insert or replace these Subscriptions, all at once."""
-        with self._connection:
-            self._connection.executemany(
+    def subscribe(self, channel: Channel, at: datetime) -> tuple[Subscribed, TrackedSubscription]:
+        """Track `channel` from `at`, unless it is tracked already.
+
+        A channel subscribed to before keeps the name and Channel folder it was first seen with.
+        """
+        with self._transaction() as connection:
+            row = connection.execute(
+                _SELECT_SUBSCRIPTION + " WHERE channel_id = ?", (channel.channel_id,)
+            ).fetchone()
+            if row is None:
+                outcome = Subscribed.STARTED
+                tracked = TrackedSubscription(
+                    channel_id=channel.channel_id,
+                    display_name=channel.display_name,
+                    channel_folder=channel_folder(channel.display_name, channel.channel_id),
+                    active=True,
+                    tracking_start=at,
+                    description=channel.description,
+                    avatar_url=channel.avatar_url,
+                    details_refreshed=at,
+                )
+            elif (known := _tracked(row)).active:
+                return Subscribed.ALREADY_ACTIVE, known
+            else:
+                outcome = Subscribed.RESTARTED
+                tracked = replace(
+                    known,
+                    active=True,
+                    tracking_start=at,
+                    description=channel.description,
+                    avatar_url=channel.avatar_url,
+                    details_refreshed=at,
+                )
+            connection.execute(
                 "INSERT INTO subscription"
                 " (channel_id, display_name, channel_folder, active, tracking_start,"
-                " description, avatar_url)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " description, avatar_url, details_refreshed)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (channel_id) DO UPDATE SET"
-                " display_name = excluded.display_name,"
-                " channel_folder = excluded.channel_folder,"
                 " active = excluded.active,"
                 " tracking_start = excluded.tracking_start,"
                 " description = excluded.description,"
-                " avatar_url = excluded.avatar_url",
-                [
-                    (
-                        s.channel_id,
-                        s.display_name,
-                        s.channel_folder,
-                        s.active,
-                        s.tracking_start.isoformat(),
-                        s.description,
-                        s.avatar_url,
-                    )
-                    for s in subscriptions
-                ],
+                " avatar_url = excluded.avatar_url,"
+                " details_refreshed = excluded.details_refreshed",
+                (
+                    tracked.channel_id,
+                    tracked.display_name,
+                    tracked.channel_folder,
+                    tracked.active,
+                    tracked.tracking_start.isoformat(),
+                    tracked.description,
+                    tracked.avatar_url,
+                    at.isoformat(),
+                ),
+            )
+        return outcome, tracked
+
+    def unsubscribe(self, channel_id: str) -> TrackedSubscription | None:
+        """Stop tracking the channel; return it, or None if it wasn't tracked."""
+        with self._transaction() as connection:
+            row = connection.execute(
+                _SELECT_SUBSCRIPTION + " WHERE channel_id = ? AND active", (channel_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE subscription SET active = 0 WHERE channel_id = ?", (channel_id,)
+            )
+        return replace(_tracked(row), active=False)
+
+    def refresh_details(self, channel: Channel, at: datetime) -> None:
+        """Remember the channel's current description and avatar, as seen at `at`."""
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE subscription SET description = ?, avatar_url = ?, details_refreshed = ?"
+                " WHERE channel_id = ?",
+                (channel.description, channel.avatar_url, at.isoformat(), channel.channel_id),
             )
 
     def record_uploads(self, channel_id: str, uploads: Iterable[Upload]) -> None:
         """Remember these uploads as pending, unless they are already known."""
-        with self._connection:
-            self._connection.executemany(
+        with self._transaction() as connection:
+            connection.executemany(
                 "INSERT INTO video (video_id, channel_id, title, released, status)"
                 " VALUES (?, ?, ?, ?, 'pending')"
                 " ON CONFLICT (video_id) DO NOTHING",
@@ -180,11 +226,12 @@ class StateStore:
 
     def pending_uploads(self, channel_id: str) -> list[Upload]:
         """The channel's uploads not downloaded yet, oldest first."""
-        rows = self._connection.execute(
-            "SELECT video_id, title, released FROM video"
-            " WHERE channel_id = ? AND status = 'pending' ORDER BY released",
-            (channel_id,),
-        )
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT video_id, title, released FROM video"
+                " WHERE channel_id = ? AND status = 'pending' ORDER BY released",
+                (channel_id,),
+            ).fetchall()
         return [
             Upload(video_id, title, datetime.fromisoformat(released))
             for video_id, title, released in rows
@@ -192,10 +239,11 @@ class StateStore:
 
     def next_episode(self, channel_id: str, season: int) -> int:
         """The episode number the channel's next video filed into `season` gets."""
-        row = self._connection.execute(
-            "SELECT last_episode FROM season WHERE channel_id = ? AND season = ?",
-            (channel_id, season),
-        ).fetchone()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT last_episode FROM season WHERE channel_id = ? AND season = ?",
+                (channel_id, season),
+            ).fetchone()
         return 1 if row is None else int(row[0]) + 1
 
     def mark_downloaded(self, video_id: str, channel_id: str, season: int, episode: int) -> None:
@@ -203,9 +251,9 @@ class StateStore:
 
         It is never fetched again, and its episode number is never handed out again.
         """
-        with self._connection:
+        with self._transaction() as connection:
             self._set_status(video_id, "downloaded")
-            self._connection.execute(
+            connection.execute(
                 "INSERT INTO season (channel_id, season, last_episode) VALUES (?, ?, ?)"
                 " ON CONFLICT (channel_id, season) DO UPDATE"
                 " SET last_episode = max(last_episode, excluded.last_episode)",
@@ -214,7 +262,7 @@ class StateStore:
 
     def mark_excluded(self, video_id: str) -> None:
         """Remember that the video is not a regular one, so it is never fetched again."""
-        with self._connection:
+        with self._transaction():
             self._set_status(video_id, "excluded")
 
     def _set_status(self, video_id: str, status: str) -> None:
@@ -224,16 +272,16 @@ class StateStore:
 
     def mark_skipped(self, video_id: str, error: str) -> None:
         """Remember that the video can never be downloaded, so it is never tried again."""
-        with self._connection:
-            self._connection.execute(
+        with self._transaction() as connection:
+            connection.execute(
                 "UPDATE video SET status = 'skipped', last_error = ? WHERE video_id = ?",
                 (error, video_id),
             )
 
     def record_failure(self, video_id: str, error: str, at: datetime) -> datetime:
         """Remember that downloading the video failed at `at`; return when it first failed."""
-        with self._connection:
-            (first_failure,) = self._connection.execute(
+        with self._transaction() as connection:
+            (first_failure,) = connection.execute(
                 "UPDATE video SET last_error = ?, first_failure = COALESCE(first_failure, ?)"
                 " WHERE video_id = ? RETURNING first_failure",
                 (error, at.astimezone(UTC).isoformat(), video_id),
@@ -242,10 +290,29 @@ class StateStore:
 
     def mark_failed(self, video_id: str) -> None:
         """Remember that the video kept failing for too long, so it is never tried again."""
-        with self._connection:
-            self._connection.execute(
-                "UPDATE video SET status = 'failed' WHERE video_id = ?", (video_id,)
-            )
+        with self._transaction() as connection:
+            connection.execute("UPDATE video SET status = 'failed' WHERE video_id = ?", (video_id,))
+
+
+_SELECT_SUBSCRIPTION = (
+    "SELECT channel_id, display_name, channel_folder, active, tracking_start,"
+    " description, avatar_url, details_refreshed FROM subscription"
+)
+
+
+def _tracked(row: tuple[Any, ...]) -> TrackedSubscription:
+    """The TrackedSubscription in a row selected with _SELECT_SUBSCRIPTION."""
+    channel_id, display_name, folder, active, start, description, avatar_url, refreshed = row
+    return TrackedSubscription(
+        channel_id,
+        display_name,
+        folder,
+        bool(active),
+        datetime.fromisoformat(start),
+        description,
+        avatar_url,
+        None if refreshed is None else datetime.fromisoformat(refreshed),
+    )
 
 
 def _migrate(connection: sqlite3.Connection) -> None:

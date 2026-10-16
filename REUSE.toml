@@ -13,3 +13,14 @@ SPDX-License-Identifier = "GPL-2.0-only"
 path = ["uv.lock", ".python-version"]
 SPDX-FileCopyrightText = "2026 Florian Weßel <florianwessel@gmx.net>"
 SPDX-License-Identifier = "GPL-2.0-only"
+
+# Vendored, unmodified, so that the web UI needs no CDN.
+[[annotations]]
+path = "src/youtube_helper/web/static/htmx.min.js"
+SPDX-FileCopyrightText = "2020 Big Sky Software <https://htmx.org>"
+SPDX-License-Identifier = "0BSD"
+
+[[annotations]]
+path = "src/youtube_helper/web/static/pico.min.css"
+SPDX-FileCopyrightText = "2019-2025 Pico <https://picocss.com>"
+SPDX-License-Identifier = "MIT"
