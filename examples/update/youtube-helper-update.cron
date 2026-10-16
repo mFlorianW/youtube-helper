@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+#
+# SPDX-License-Identifier: GPL-2.0-only
+
+# Pulls the latest youtube-helper image daily, recreates the container if the image changed
+# and removes the image it replaced (any dangling, i.e. untagged, image). The cron alternative to the systemd timer next to this file; use one, not both.
+# See "Updates" in the README.
+#
+# Install as /etc/cron.d/youtube-helper-update: without the `.cron` (cron skips file names
+# with a dot), owned by root and writable only by root. Cron mails what the commands print
+# to root, if mail is set up on the host.
+
+# adjust: the time (here 04:30) and the directory holding youtube-helper's compose.yaml.
+# m  h  dom mon dow  user  command
+30   4  *   *   *    root  cd /srv/youtube-helper && docker compose pull --quiet && docker compose up -d && docker image prune --force

@@ -729,6 +729,7 @@ dependencies = [
     { name = "httpx" },
     { name = "tzdata" },
     { name = "yt-dlp", extra = ["default"] },
+    { name = "yt-dlp-ejs" },
 ]
 
 [package.dev-dependencies]
@@ -743,6 +744,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "tzdata", specifier = ">=2026.5" },
     { name = "yt-dlp", extras = ["default"], specifier = ">=2026.8.19" },
+    { name = "yt-dlp-ejs", specifier = ">=0.8.0" },
 ]
 
 [package.metadata.requires-dev]

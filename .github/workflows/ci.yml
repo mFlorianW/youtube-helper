@@ -32,6 +32,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: youtube-helper:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # yt-dlp can't solve YouTube's challenges without yt-dlp-ejs and a JavaScript runtime
+      # it supports, and nothing else in CI would notice either one missing. `yt-dlp -v`
+      # reports both in its debug header (and then fails for want of a URL).
+      - name: Check that yt-dlp finds Deno and yt-dlp-ejs in the image
+        run: |
+          header=$(docker run --rm --entrypoint yt-dlp youtube-helper:ci -v 2>&1 || true)
+          echo "$header"
+          grep -Eq '^\[debug\] JS runtimes: (.*, )?deno-[0-9.]+(,|$)' <<<"$header" \
+            || { echo "::error::yt-dlp finds no supported Deno"; exit 1; }
+          grep -Eq '^\[debug\] Optional libraries: (.*, )?yt_dlp_ejs-[0-9.]+(,|$)' <<<"$header" \
+            || { echo "::error::yt-dlp finds no yt-dlp-ejs"; exit 1; }
       - uses: docker/login-action@v4
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
@@ -39,17 +57,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/mflorianw/youtube-helper
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
+      # Every merge to main publishes the image the check above passed, rebuilt from cache.
       - uses: docker/build-push-action@v7
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           context: .
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
