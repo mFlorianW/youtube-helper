@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+-->
+
 # youtube-helper
 
 Keeps a Jellyfin media library stocked with new videos from the YouTube channels the owner is subscribed to.
