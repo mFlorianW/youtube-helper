@@ -221,3 +221,9 @@ uv run pytest
 
 `uv run pytest -m smoke` additionally downloads a short public video from YouTube for real; it
 needs network access, `ffmpeg` and `deno`.
+
+## Privacy policy and terms
+
+The [Datenschutzerklärung](docs/legal/datenschutz.md) (privacy policy) and the
+[Nutzungsbedingungen](docs/legal/nutzungsbedingungen.md) (terms of service) cover the
+`youtube-helper` OAuth client; link them on the Google Auth Platform **Branding** page.
