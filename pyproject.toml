@@ -5,7 +5,7 @@
 [project]
 name = "youtube-helper"
 version = "0.1.0"
-description = "Keeps a media library stocked with New uploads from the owner's YouTube Subscriptions"
+description = "Keeps a Media library stocked with New uploads from the owner's YouTube Subscriptions"
 authors = [
     { name = "Florian Weßel", email = "florianwessel@gmx.net" }
 ]

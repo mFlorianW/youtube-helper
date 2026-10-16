@@ -14,7 +14,6 @@ DATABASE_NAME = "youtube-helper.sqlite3"
 class StateUnavailable(Exception):
     def __init__(self, path: Path, reason: sqlite3.Error) -> None:
         super().__init__(f"State database {path} can't be opened: {reason}")
-        self.path = path
 
 
 class StateStore:

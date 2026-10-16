@@ -11,7 +11,6 @@ from pathlib import Path
 class MediaLibraryUnwritable(Exception):
     def __init__(self, path: Path, reason: OSError) -> None:
         super().__init__(f"Media library {path} is not writable: {reason.strerror or reason}")
-        self.path = path
 
 
 def ensure_writable(path: Path) -> None:

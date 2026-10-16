@@ -18,6 +18,5 @@ RUN uv sync --locked --no-dev --no-editable
 FROM python:3.14-slim
 COPY --from=build /app/.venv /app/.venv
 ENV PATH=/app/.venv/bin:$PATH \
-    PYTHONUNBUFFERED=1 \
-    STATE_DIR=/state
+    PYTHONUNBUFFERED=1
 ENTRYPOINT ["youtube-helper"]

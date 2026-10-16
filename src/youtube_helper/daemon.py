@@ -10,6 +10,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from datetime import timedelta
 from types import FrameType
 from typing import NoReturn
@@ -29,30 +30,20 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
     try:
         config = load_config(environ)
         ensure_writable(config.media_library)
-    except (ConfigError, MediaLibraryUnwritable) as error:
+        log.info(
+            "Starting with Media library %s, state in %s, time zone %s",
+            config.media_library,
+            config.state_dir,
+            config.timezone,
+        )
+        with closing(StateStore.open(config.state_dir)) as state:
+            cycle = Cycle(config.media_library, state)
+            while True:
+                cycle.run()
+                sleep(CYCLE_INTERVAL.total_seconds())
+    except (ConfigError, MediaLibraryUnwritable, StateUnavailable) as error:
         log.error("%s", error)
         return 1
-    log.info(
-        "Starting with Media library %s, state in %s, time zone %s",
-        config.media_library,
-        config.state_dir,
-        config.timezone,
-    )
-    try:
-        state = StateStore.open(config.state_dir)
-    except StateUnavailable as error:
-        log.error("%s", error)
-        return 1
-    try:
-        cycle = Cycle(config.media_library, state)
-        while True:
-            cycle.run()
-            sleep(CYCLE_INTERVAL.total_seconds())
-    except MediaLibraryUnwritable as error:
-        log.error("%s", error)
-        return 1
-    finally:
-        state.close()
 
 
 def _stop(signum: int, frame: FrameType | None) -> NoReturn:
