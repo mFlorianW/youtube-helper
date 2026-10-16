@@ -28,7 +28,14 @@ from youtube_helper.media_library import (
 )
 from youtube_helper.state import StateStore, TrackedSubscription
 from youtube_helper.upload_feed import FeedUnavailable, Upload, UploadFeed
-from youtube_helper.video_fetcher import BotCheck, FetchFailed, VideoFetcher, VideoUnavailable
+from youtube_helper.video_fetcher import (
+    BotCheck,
+    FetchFailed,
+    NotAiredYet,
+    NotRegularVideo,
+    VideoFetcher,
+    VideoUnavailable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +139,18 @@ class Cycle:
             with staged(self._media_library, upload.video_id) as staged_base:
                 self._fetcher.fetch(upload.video_id, staged_base)
                 file_video(staged_base, base)
+        except NotRegularVideo as kind:
+            self._state.mark_excluded(upload.video_id)
+            log.info("Excluded %s (%s): %s", upload.title, upload.video_id, kind)
+            downloads.not_attempted()
+        except NotAiredYet as reason:
+            log.info(
+                "%s (%s) has not aired yet (%s); trying again next cycle",
+                upload.title,
+                upload.video_id,
+                reason,
+            )
+            downloads.not_attempted()
         except VideoUnavailable as error:
             self._state.mark_skipped(upload.video_id, str(error))
             log.warning("Skipped %s (%s) for good: %s", upload.title, upload.video_id, error)
@@ -239,6 +258,10 @@ class _Downloads:
 
     attempts: int = 0
     failures: list[_Failure] = field(default_factory=list)
+
+    def not_attempted(self) -> None:
+        """Take back the last attempt: the video isn't to be downloaded (yet), nothing failed."""
+        self.attempts -= 1
 
     def _yt_dlp_broken(self) -> bool:
         """Whether every download attempt failed, and in yt-dlp: not writing the Media library."""
