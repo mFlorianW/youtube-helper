@@ -38,38 +38,26 @@ The image and the settings are the same as with plain Compose.
 ## Updates
 
 YouTube changes its site often, and yt-dlp keeps up with frequent releases. An outdated yt-dlp
-soon fails every download, so updates reach the server without manual work:
+soon fails every download, so updates reach the host without manual work:
 
-1. [Renovate](https://docs.renovatebot.com/) opens a pull request when yt-dlp, yt-dlp-ejs or
-   Deno (the JavaScript runtime yt-dlp needs for YouTube) has a new release, and merges it
-   itself once CI has passed. yt-dlp-ejs updates come with the yt-dlp update that needs them.
-   PRs for other dependencies are opened too, but wait for a human. See
-   [`renovate.json5`](renovate.json5).
+1. The [Renovate](https://docs.renovatebot.com/) GitHub app opens a pull request when yt-dlp,
+   yt-dlp-ejs or Deno (the JavaScript runtime yt-dlp needs for YouTube) has a new release, and
+   merges it itself once CI has passed. yt-dlp-ejs updates come with the yt-dlp update that
+   needs them; Deno major releases wait for a human. PRs for other dependencies are opened
+   too, but wait for a human. See [`renovate.json5`](renovate.json5).
 2. CI checks that yt-dlp in the built image finds Deno and yt-dlp-ejs. Every merge to `main`
    publishes the image as `ghcr.io/mflorianw/youtube-helper:latest`.
-3. On the server, a daily job runs `docker compose pull && docker compose up -d` in the
+3. On the host, a daily job runs `docker compose pull && docker compose up -d` in the
    compose project's directory. It recreates the container only if a new image was pulled.
 
 For step 3, install either the systemd timer or the cron job from
-[`examples/update/`](examples/update/). Adjust the directory if your `compose.yaml` isn't in
-`/srv/youtube-helper`.
+[`examples/update/`](examples/update/); each file's header says how. Adjust the directory if
+your `compose.yaml` isn't in `/srv/youtube-helper`.
 
-```sh
-# systemd
-cp examples/update/youtube-helper-update.service examples/update/youtube-helper-update.timer \
-   /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now youtube-helper-update.timer
-systemctl list-timers youtube-helper-update.timer   # next run
-
-# or cron
-cp examples/update/youtube-helper-update.cron /etc/cron.d/youtube-helper-update
-```
-
-A yt-dlp fix thus usually reaches the server within a day. Pulled images pile up, so remove old
-ones now and then with `docker image prune`. With Docker Swarm, run
-`docker stack deploy -c stack.yaml youtube-helper` instead: it pulls `latest` again and updates
-the service if the image changed.
+A yt-dlp fix thus usually reaches the host within a day. Pulled images pile up, so remove old
+ones now and then with `docker image prune`. With Docker Swarm, change the job's commands to
+`docker stack deploy -c stack.yaml youtube-helper`, run in the directory holding `stack.yaml`:
+it pulls `latest` again and updates the service if the image changed.
 
 ## Logging in
 

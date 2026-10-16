@@ -7,8 +7,8 @@
   extends: ["config:recommended"],
   // Renovate merges by itself, once every check on the PR has passed, instead of relying on
   // GitHub's auto-merge; that would merge right away unless branch protection requires the
-  // checks. Renovate merges with its app token, so the push to main runs CI and publishes
-  // the image.
+  // checks. The Renovate GitHub app merges with its own token (unlike GITHUB_TOKEN), so the
+  // push to main runs CI and publishes the image.
   platformAutomerge: false,
   packageRules: [
     {
@@ -26,10 +26,16 @@
     {
       // The JavaScript runtime yt-dlp-ejs runs YouTube's challenges in. Its binary-only
       // image tags look like `bin-2.9.7`.
-      description: "Auto-merge Deno updates",
       matchManagers: ["dockerfile"],
       matchPackageNames: ["denoland/deno"],
       versioning: "regex:^bin-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$",
+    },
+    {
+      // A new Deno major may break yt-dlp-ejs in ways CI can't see, so it waits for a human.
+      description: "Auto-merge Deno minor and patch updates",
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["denoland/deno"],
+      matchUpdateTypes: ["minor", "patch"],
       automerge: true,
     },
   ],
