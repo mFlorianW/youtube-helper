@@ -54,6 +54,7 @@ services:
 # Compose (without Swarm) bind-mounts each secret file into the container: it is not
 # encrypted, and the host file's owner and mode apply. Keep the files readable only by the
 # user above, e.g. `chmod 600 secrets/*` after `chown 1000:1000 secrets/*`.
+# For encrypted secrets with no files on the host, deploy with Swarm instead (stack.yaml).
 secrets:
   google_client_id:
     # A file containing only the OAuth client ID ("…apps.googleusercontent.com").
