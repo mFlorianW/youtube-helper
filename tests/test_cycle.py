@@ -371,6 +371,7 @@ def test_new_upload_lands_in_its_channel_folder_named_by_release_time_in_local_t
         Path("First Channel", "Season 2026", f"{basename}-thumb.jpg"),
         Path("First Channel", "Season 2026", f"{basename}.mkv"),
         Path("First Channel", "Season 2026", f"{basename}.nfo"),
+        Path("First Channel", "tvshow.nfo"),
     ]
     video = media_library / "First Channel" / "Season 2026" / f"{basename}.mkv"
     assert video.read_bytes() == b"video vid00000001"
@@ -681,3 +682,41 @@ def test_video_downloaded_after_a_failure_gets_the_next_number(
         "vid00000001": ("2026", "2"),
         "vid00000002": ("2026", "1"),
     }
+
+
+def test_channel_folder_gets_a_tvshow_nfo_with_its_first_video(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    assert media_files(media_library) == []
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert nfo(media_library / "First Channel" / "tvshow.nfo") == (
+        "tvshow",
+        {"title": "First Channel", "plot": "About First", "uniqueid youtube": "UC1"},
+    )
+
+
+def test_tvshow_nfo_is_written_from_the_last_known_subscription_while_the_login_has_lapsed(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    account.current = [Subscription("UC1", "Renamed Channel", None, "New description")]
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    account.current = LoginLapsed()
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=35)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    # The name stays the one from first sight, like the Channel folder; the plot is current.
+    assert nfo(media_library / "First Channel" / "tvshow.nfo") == (
+        "tvshow",
+        {"title": "First Channel", "plot": "New description", "uniqueid youtube": "UC1"},
+    )

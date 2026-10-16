@@ -20,13 +20,15 @@ from youtube_helper.account import (
 )
 from youtube_helper.media_library import (
     NFO_SUFFIX,
+    TVSHOW_NFO,
     channel_folder,
     ensure_writable,
+    file_atomically,
     file_video,
     staged,
     video_base,
 )
-from youtube_helper.nfo import episode_nfo
+from youtube_helper.nfo import episode_nfo, tvshow_nfo
 from youtube_helper.state import StateStore, TrackedSubscription
 from youtube_helper.upload_feed import FeedUnavailable, UploadFeed
 from youtube_helper.video_fetcher import FetchFailed, VideoFetcher
@@ -64,6 +66,7 @@ class Cycle:
         for subscription in self._active_subscriptions():
             self._detect_new_uploads(subscription)
             self._download_new_uploads(subscription)
+            self._complete_channel_folder(subscription)
         log.info("Cycle finished")
 
     def _detect_new_uploads(self, subscription: TrackedSubscription) -> None:
@@ -121,6 +124,23 @@ class Cycle:
             )
             log.info("Downloaded %s", base.relative_to(self._media_library))
 
+    def _complete_channel_folder(self, subscription: TrackedSubscription) -> None:
+        """Give a Channel folder holding videos the series metadata it still lacks."""
+        folder = self._media_library / subscription.channel_folder
+        if not folder.is_dir():
+            return
+        tvshow = folder / TVSHOW_NFO
+        if not tvshow.exists():
+            file_atomically(
+                self._media_library,
+                tvshow,
+                tvshow_nfo(
+                    title=subscription.display_name,
+                    plot=subscription.description,
+                    channel_id=subscription.channel_id,
+                ),
+            )
+
     def _active_subscriptions(self) -> list[TrackedSubscription]:
         """The Subscriptions to follow this cycle, synced with the account when it can be read."""
         try:
@@ -158,13 +178,28 @@ class Cycle:
                     ),
                     active=True,
                     tracking_start=now,
+                    description=subscription.description,
+                    avatar_url=subscription.avatar_url,
                 )
                 action = "Started"
             elif not tracked.active:
                 # Keep the name from first sight: the Channel folder never follows a rename.
-                tracked = replace(tracked, active=True, tracking_start=now)
+                tracked = replace(
+                    tracked,
+                    active=True,
+                    tracking_start=now,
+                    description=subscription.description,
+                    avatar_url=subscription.avatar_url,
+                )
                 action = "Restarted"
             else:
+                details = replace(
+                    tracked,
+                    description=subscription.description,
+                    avatar_url=subscription.avatar_url,
+                )
+                if details != tracked:
+                    changed.append(details)
                 continue
             changed.append(tracked)
             log.info(

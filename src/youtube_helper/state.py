@@ -51,6 +51,8 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     " season INTEGER NOT NULL,"
     " last_episode INTEGER NOT NULL,"
     " PRIMARY KEY (channel_id, season))",
+    "ALTER TABLE subscription ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE subscription ADD COLUMN avatar_url TEXT",
 )
 
 
@@ -64,7 +66,7 @@ class TrackedSubscription:
     """A Subscription as the tool knows it: inactive once the owner has unsubscribed.
 
     The display name and the Channel folder are the ones from first sight; later renames don't
-    change them.
+    change them. The description and avatar URL are the ones last seen.
     """
 
     channel_id: str
@@ -72,6 +74,8 @@ class TrackedSubscription:
     channel_folder: str
     active: bool
     tracking_start: datetime
+    description: str
+    avatar_url: str | None
 
     def tracks(self, upload: Upload) -> bool:
         """Whether `upload` is a New upload: released after the current tracking start."""
@@ -113,14 +117,21 @@ class StateStore:
     def tracked_subscriptions(self) -> list[TrackedSubscription]:
         """Every Subscription ever seen, active or not, in the order first seen."""
         rows = self._connection.execute(
-            "SELECT channel_id, display_name, channel_folder, active, tracking_start"
+            "SELECT channel_id, display_name, channel_folder, active, tracking_start,"
+            " description, avatar_url"
             " FROM subscription ORDER BY rowid"
         )
         return [
             TrackedSubscription(
-                channel_id, display_name, folder, bool(active), datetime.fromisoformat(start)
+                channel_id,
+                display_name,
+                folder,
+                bool(active),
+                datetime.fromisoformat(start),
+                description,
+                avatar_url,
             )
-            for channel_id, display_name, folder, active, start in rows
+            for channel_id, display_name, folder, active, start, description, avatar_url in rows
         ]
 
     def save_tracked_subscriptions(self, subscriptions: Iterable[TrackedSubscription]) -> None:
@@ -128,13 +139,16 @@ class StateStore:
         with self._connection:
             self._connection.executemany(
                 "INSERT INTO subscription"
-                " (channel_id, display_name, channel_folder, active, tracking_start)"
-                " VALUES (?, ?, ?, ?, ?)"
+                " (channel_id, display_name, channel_folder, active, tracking_start,"
+                " description, avatar_url)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (channel_id) DO UPDATE SET"
                 " display_name = excluded.display_name,"
                 " channel_folder = excluded.channel_folder,"
                 " active = excluded.active,"
-                " tracking_start = excluded.tracking_start",
+                " tracking_start = excluded.tracking_start,"
+                " description = excluded.description,"
+                " avatar_url = excluded.avatar_url",
                 [
                     (
                         s.channel_id,
@@ -142,6 +156,8 @@ class StateStore:
                         s.channel_folder,
                         s.active,
                         s.tracking_start.isoformat(),
+                        s.description,
+                        s.avatar_url,
                     )
                     for s in subscriptions
                 ],

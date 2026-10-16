@@ -24,6 +24,7 @@ from youtube_helper.video_fetcher import THUMBNAIL_SUFFIX, VIDEO_SUFFIX
 STAGING_DIR = ".youtube-helper-staging"
 
 NFO_SUFFIX = ".nfo"
+TVSHOW_NFO = "tvshow.nfo"
 
 # Room for the longest suffix (`-thumb.jpg`) within the usual 255-byte filename limit.
 MAX_BASENAME_BYTES = 240
@@ -76,6 +77,20 @@ def staged(media_library: Path, video_id: str) -> Iterator[Path]:
         yield directory / "video"
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def file_atomically(media_library: Path, path: Path, content: bytes) -> None:
+    """Write `content` to `path`, so it appears complete or not at all."""
+    staging = media_library / STAGING_DIR
+    staging.mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=staging, delete=False) as file:
+        try:
+            file.write(content)
+            file.close()
+            Path(file.name).replace(path)
+        except BaseException:
+            Path(file.name).unlink(missing_ok=True)
+            raise
 
 
 def file_video(staged_base: Path, base: Path) -> None:
