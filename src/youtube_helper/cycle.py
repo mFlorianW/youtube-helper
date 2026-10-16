@@ -18,14 +18,20 @@ from youtube_helper.account import (
     LoginMissing,
     Subscription,
 )
+from youtube_helper.artwork import Artwork, ArtworkUnavailable
 from youtube_helper.media_library import (
+    NFO_SUFFIX,
+    POSTER,
+    TVSHOW_NFO,
     channel_folder,
     ensure_writable,
+    file_atomically,
     file_video,
     free_space,
     staged,
     video_base,
 )
+from youtube_helper.nfo import episode_nfo, tvshow_nfo
 from youtube_helper.state import StateStore, TrackedSubscription
 from youtube_helper.upload_feed import FeedUnavailable, Upload, UploadFeed
 from youtube_helper.video_fetcher import (
@@ -58,6 +64,7 @@ class Cycle:
         account: Account,
         feed: UploadFeed,
         fetcher: VideoFetcher,
+        artwork: Artwork,
         timezone: ZoneInfo,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         free_space: Callable[[Path], int] = free_space,
@@ -67,6 +74,7 @@ class Cycle:
         self._account = account
         self._feed = feed
         self._fetcher = fetcher
+        self._artwork = artwork
         self._timezone = timezone
         self._clock = clock
         self._free_space = free_space
@@ -84,6 +92,8 @@ class Cycle:
         downloads = _Downloads()
         self._download_new_uploads(subscriptions, downloads)
         downloads.report_retries()
+        for subscription in subscriptions:
+            self._complete_channel_folder(subscription)
         log.info("Cycle finished")
 
     def _enough_free_space(self) -> bool:
@@ -133,11 +143,23 @@ class Cycle:
         self, subscription: TrackedSubscription, upload: Upload, downloads: _Downloads
     ) -> None:
         base = video_base(self._media_library, subscription.channel_folder, upload, self._timezone)
+        aired = upload.released.astimezone(self._timezone).date()
+        # Numbered when filed, so a video arriving late gets the next number of its season.
+        episode = self._state.next_episode(subscription.channel_id, aired.year)
         log.info("Downloading %s (%s)", upload.title, upload.video_id)
         downloads.attempts += 1
         try:
             with staged(self._media_library, upload.video_id) as staged_base:
-                self._fetcher.fetch(upload.video_id, staged_base)
+                metadata = self._fetcher.fetch(upload.video_id, staged_base)
+                staged_base.with_name(staged_base.name + NFO_SUFFIX).write_bytes(
+                    episode_nfo(
+                        title=upload.title,
+                        plot=metadata.description,
+                        aired=aired,
+                        episode=episode,
+                        video_id=upload.video_id,
+                    )
+                )
                 file_video(staged_base, base)
         except NotRegularVideo as kind:
             self._state.mark_excluded(upload.video_id)
@@ -157,7 +179,9 @@ class Cycle:
         except (FetchFailed, OSError) as error:
             self._retry_later(upload, error, downloads)
         else:
-            self._state.mark_downloaded(upload.video_id)
+            self._state.mark_downloaded(
+                upload.video_id, subscription.channel_id, aired.year, episode
+            )
             log.info("Downloaded %s", base.relative_to(self._media_library))
 
     def _retry_later(self, upload: Upload, error: Exception, downloads: _Downloads) -> None:
@@ -176,6 +200,43 @@ class Cycle:
             downloads.failures.append(_Failure(upload, error, retried=False))
         else:
             downloads.failures.append(_Failure(upload, error, retried=True))
+
+    def _complete_channel_folder(self, subscription: TrackedSubscription) -> None:
+        """Keep a Channel folder holding videos furnished with its `tvshow.nfo` and poster.
+
+        The `tvshow.nfo` follows the channel's description; the poster is downloaded once.
+        Whatever can't be written is tried again next cycle.
+        """
+        folder = self._media_library / subscription.channel_folder
+        if not folder.is_dir():
+            return
+        tvshow = folder / TVSHOW_NFO
+        content = tvshow_nfo(
+            title=subscription.display_name,
+            plot=subscription.description,
+            channel_id=subscription.channel_id,
+        )
+        try:
+            if not tvshow.exists() or tvshow.read_bytes() != content:
+                file_atomically(self._media_library, tvshow, content)
+        except OSError as error:
+            log.warning(
+                "Can't write the %s of %s (%s); trying again next cycle",
+                TVSHOW_NFO,
+                subscription.display_name,
+                error,
+            )
+        poster = folder / POSTER
+        if subscription.avatar_url is not None and not poster.exists():
+            try:
+                image = self._artwork.download(subscription.avatar_url)
+                file_atomically(self._media_library, poster, image)
+            except (ArtworkUnavailable, OSError) as error:
+                log.warning(
+                    "Can't download the poster of %s (%s); trying again next cycle",
+                    subscription.display_name,
+                    error,
+                )
 
     def _active_subscriptions(self) -> list[TrackedSubscription]:
         """The Subscriptions to follow this cycle, synced with the account when it can be read."""
@@ -214,15 +275,24 @@ class Cycle:
                     ),
                     active=True,
                     tracking_start=now,
+                    description=subscription.description,
+                    avatar_url=subscription.avatar_url,
                 )
                 action = "Started"
             elif not tracked.active:
-                # Keep the name from first sight: the Channel folder never follows a rename.
                 tracked = replace(tracked, active=True, tracking_start=now)
                 action = "Restarted"
             else:
+                action = None
+            # Keep the name from first sight: the Channel folder never follows a rename.
+            # The description and avatar do follow the channel.
+            refreshed = replace(
+                tracked, description=subscription.description, avatar_url=subscription.avatar_url
+            )
+            if refreshed != known.get(subscription.channel_id):
+                changed.append(refreshed)
+            if action is None:
                 continue
-            changed.append(tracked)
             log.info(
                 "%s tracking %s (%s) from %s",
                 action,

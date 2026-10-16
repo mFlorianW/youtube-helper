@@ -5,7 +5,8 @@
 """The Media library: the admin-specified directory the tool files downloaded videos into.
 
 Its layout is fixed:
-`<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>].mkv`.
+`<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>].mkv`,
+with the episode `.nfo` and the `-thumb.jpg` next to each video.
 """
 
 import re
@@ -21,6 +22,10 @@ from youtube_helper.video_fetcher import THUMBNAIL_SUFFIX, VIDEO_SUFFIX
 
 # Hidden, so media servers skip it; inside the Media library, so filing is an atomic rename.
 STAGING_DIR = ".youtube-helper-staging"
+
+NFO_SUFFIX = ".nfo"
+TVSHOW_NFO = "tvshow.nfo"
+POSTER = "poster.jpg"
 
 # Room for the longest suffix (`-thumb.jpg`) within the usual 255-byte filename limit.
 MAX_BASENAME_BYTES = 240
@@ -80,13 +85,27 @@ def staged(media_library: Path, video_id: str) -> Iterator[Path]:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def file_atomically(media_library: Path, path: Path, content: bytes) -> None:
+    """Write `content` to `path`, so it appears complete or not at all."""
+    staging = media_library / STAGING_DIR
+    staging.mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=staging, delete=False) as file:
+        try:
+            file.write(content)
+            file.close()
+            Path(file.name).replace(path)
+        except BaseException:
+            Path(file.name).unlink(missing_ok=True)
+            raise
+
+
 def file_video(staged_base: Path, base: Path) -> None:
     """Move a staged download to its final name, the video last.
 
     Each file appears complete under its final name or not at all.
     """
     base.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in (THUMBNAIL_SUFFIX, VIDEO_SUFFIX):
+    for suffix in (THUMBNAIL_SUFFIX, NFO_SUFFIX, VIDEO_SUFFIX):
         staged_file = staged_base.with_name(staged_base.name + suffix)
         if staged_file.exists():
             staged_file.replace(base.with_name(base.name + suffix))

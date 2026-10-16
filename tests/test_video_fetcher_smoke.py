@@ -20,7 +20,9 @@ VIDEO_ID = "jNQXAC9IVRw"
 def test_downloads_a_public_video_as_mkv_with_metadata_and_thumbnail(tmp_path: Path) -> None:
     base = tmp_path / "video"
 
-    YtDlpFetcher().fetch(VIDEO_ID, base)
+    metadata = YtDlpFetcher().fetch(VIDEO_ID, base)
+
+    assert metadata.description
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["video-thumb.jpg", "video.mkv"]
     assert (tmp_path / "video-thumb.jpg").read_bytes().startswith(b"\xff\xd8")

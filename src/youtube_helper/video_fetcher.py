@@ -5,6 +5,7 @@
 """The Video fetcher port: downloads one video, anonymously, with yt-dlp."""
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -39,14 +40,21 @@ class NotAiredYet(Exception):
     """The video is a premiere that hasn't aired yet; it can be fetched once it has."""
 
 
+@dataclass(frozen=True)
+class VideoMetadata:
+    """What the episode NFO needs beyond what the Upload feed tells."""
+
+    description: str
+
+
 class VideoFetcher(Protocol):
-    def fetch(self, video_id: str, base: Path) -> None:
+    def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         """Download the video as `<base>.mkv`, its thumbnail as `<base>-thumb.jpg`.
 
         Only regular videos are downloaded: raises NotRegularVideo for a Short or a livestream,
         NotAiredYet for a premiere that hasn't aired yet. The thumbnail may be missing if YouTube
-        has none. Raises VideoUnavailable if the video can never be downloaded, BotCheck if
-        YouTube asked for a bot check, FetchFailed otherwise.
+        has none. Returns what the episode NFO needs. Raises VideoUnavailable if the video can
+        never be downloaded, BotCheck if YouTube asked for a bot check, FetchFailed otherwise.
         """
         ...
 
@@ -54,7 +62,7 @@ class VideoFetcher(Protocol):
 class YtDlpFetcher:
     """Downloads with the embedded yt-dlp, anonymously: no cookies, ever."""
 
-    def fetch(self, video_id: str, base: Path) -> None:
+    def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         try:
             # Look before downloading. Tolerating missing formats lets an upcoming premiere tell
             # what it is instead of failing; it also hides why formats are missing otherwise, so
@@ -63,11 +71,12 @@ class YtDlpFetcher:
                 info = ydl.extract_info(WATCH_URL + video_id, download=False, process=False)
             _ensure_regular(info)
             with yt_dlp.YoutubeDL(_options(base)) as ydl:
-                ydl.download([WATCH_URL + video_id])
+                info = ydl.extract_info(WATCH_URL + video_id, download=True)
         except YoutubeDLError as error:
             raise _classify(str(error)) from error
         if not base.with_name(base.name + VIDEO_SUFFIX).is_file():
             raise FetchFailed(f"yt-dlp produced no {VIDEO_SUFFIX} file")
+        return VideoMetadata(description=str(info.get("description") or ""))
 
 
 def _ensure_regular(info: dict[str, Any]) -> None:

@@ -48,6 +48,13 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     _name_channel_folders,
     "ALTER TABLE video ADD COLUMN last_error TEXT",
     "ALTER TABLE video ADD COLUMN first_failure TEXT",
+    "CREATE TABLE season ("
+    " channel_id TEXT NOT NULL,"
+    " season INTEGER NOT NULL,"
+    " last_episode INTEGER NOT NULL,"
+    " PRIMARY KEY (channel_id, season))",
+    "ALTER TABLE subscription ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE subscription ADD COLUMN avatar_url TEXT",
 )
 
 
@@ -61,7 +68,7 @@ class TrackedSubscription:
     """A Subscription as the tool knows it: inactive once the owner has unsubscribed.
 
     The display name and the Channel folder are the ones from first sight; later renames don't
-    change them.
+    change them. The description and avatar URL are the ones last seen.
     """
 
     channel_id: str
@@ -69,6 +76,8 @@ class TrackedSubscription:
     channel_folder: str
     active: bool
     tracking_start: datetime
+    description: str
+    avatar_url: str | None
 
     def tracks(self, upload: Upload) -> bool:
         """Whether `upload` is a New upload: released after the current tracking start."""
@@ -110,14 +119,21 @@ class StateStore:
     def tracked_subscriptions(self) -> list[TrackedSubscription]:
         """Every Subscription ever seen, active or not, in the order first seen."""
         rows = self._connection.execute(
-            "SELECT channel_id, display_name, channel_folder, active, tracking_start"
+            "SELECT channel_id, display_name, channel_folder, active, tracking_start,"
+            " description, avatar_url"
             " FROM subscription ORDER BY rowid"
         )
         return [
             TrackedSubscription(
-                channel_id, display_name, folder, bool(active), datetime.fromisoformat(start)
+                channel_id,
+                display_name,
+                folder,
+                bool(active),
+                datetime.fromisoformat(start),
+                description,
+                avatar_url,
             )
-            for channel_id, display_name, folder, active, start in rows
+            for channel_id, display_name, folder, active, start, description, avatar_url in rows
         ]
 
     def save_tracked_subscriptions(self, subscriptions: Iterable[TrackedSubscription]) -> None:
@@ -125,13 +141,16 @@ class StateStore:
         with self._connection:
             self._connection.executemany(
                 "INSERT INTO subscription"
-                " (channel_id, display_name, channel_folder, active, tracking_start)"
-                " VALUES (?, ?, ?, ?, ?)"
+                " (channel_id, display_name, channel_folder, active, tracking_start,"
+                " description, avatar_url)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (channel_id) DO UPDATE SET"
                 " display_name = excluded.display_name,"
                 " channel_folder = excluded.channel_folder,"
                 " active = excluded.active,"
-                " tracking_start = excluded.tracking_start",
+                " tracking_start = excluded.tracking_start,"
+                " description = excluded.description,"
+                " avatar_url = excluded.avatar_url",
                 [
                     (
                         s.channel_id,
@@ -139,6 +158,8 @@ class StateStore:
                         s.channel_folder,
                         s.active,
                         s.tracking_start.isoformat(),
+                        s.description,
+                        s.avatar_url,
                     )
                     for s in subscriptions
                 ],
@@ -169,19 +190,37 @@ class StateStore:
             for video_id, title, released in rows
         ]
 
-    def mark_downloaded(self, video_id: str) -> None:
-        """Remember that the video is in the Media library, so it is never fetched again."""
-        self._set_status(video_id, "downloaded")
+    def next_episode(self, channel_id: str, season: int) -> int:
+        """The episode number the channel's next video filed into `season` gets."""
+        row = self._connection.execute(
+            "SELECT last_episode FROM season WHERE channel_id = ? AND season = ?",
+            (channel_id, season),
+        ).fetchone()
+        return 1 if row is None else int(row[0]) + 1
+
+    def mark_downloaded(self, video_id: str, channel_id: str, season: int, episode: int) -> None:
+        """Remember that the video is in the Media library as this episode of `season`.
+
+        It is never fetched again, and its episode number is never handed out again.
+        """
+        with self._connection:
+            self._set_status(video_id, "downloaded")
+            self._connection.execute(
+                "INSERT INTO season (channel_id, season, last_episode) VALUES (?, ?, ?)"
+                " ON CONFLICT (channel_id, season) DO UPDATE"
+                " SET last_episode = max(last_episode, excluded.last_episode)",
+                (channel_id, season, episode),
+            )
 
     def mark_excluded(self, video_id: str) -> None:
         """Remember that the video is not a regular one, so it is never fetched again."""
-        self._set_status(video_id, "excluded")
+        with self._connection:
+            self._set_status(video_id, "excluded")
 
     def _set_status(self, video_id: str, status: str) -> None:
-        with self._connection:
-            self._connection.execute(
-                "UPDATE video SET status = ? WHERE video_id = ?", (status, video_id)
-            )
+        self._connection.execute(
+            "UPDATE video SET status = ? WHERE video_id = ?", (status, video_id)
+        )
 
     def mark_skipped(self, video_id: str, error: str) -> None:
         """Remember that the video can never be downloaded, so it is never tried again."""

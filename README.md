@@ -137,7 +137,10 @@ i.e. a video released after the Subscription's tracking start, is downloaded ano
 yt-dlp (never with your Google cookies) and filed into the Media library:
 
 ```text
+<Media library>/<Channel folder>/tvshow.nfo
+<Media library>/<Channel folder>/poster.jpg
 <Media library>/<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>].mkv
+<Media library>/<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>].nfo
 <Media library>/<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>]-thumb.jpg
 ```
 
@@ -172,6 +175,23 @@ yt-dlp (never with your Google cookies) and filed into the Media library:
   good, yt-dlp has most likely fallen behind a change on YouTube's side. Instead of one error per video, the daemon then logs
   a single `All downloads failing …; yt-dlp is likely outdated, pull the latest image`. Pulling
   the latest image brings the newest yt-dlp; the videos are tried again on the next cycle.
+
+### Metadata for the media server
+
+The Media library carries its metadata as NFO files, so Jellyfin (a **Shows** library pointed
+at the Media library) or any other NFO-aware media server shows each Subscription as a show
+with its videos in release order, without any plugin:
+
+- `tvshow.nfo` in each Channel folder holds the channel's name (the one from first sight, like
+  the Channel folder), its description and its channel ID; `poster.jpg` is the channel's avatar.
+  Both appear with the channel's first video. The description follows the channel; the poster
+  is downloaded once, and tried again every cycle until that succeeds.
+- The `.nfo` next to each video holds its title, description, release date, season (the
+  release year) and episode number, and its video ID.
+- Episodes are numbered per Channel folder and season in the order they are downloaded,
+  normally release order; each new year starts again at 1. Numbers never change, so a video
+  that arrives late, e.g. a premiere airing after newer videos or a video whose download failed
+  at first, gets the next number.
 
 ## Configuration
 

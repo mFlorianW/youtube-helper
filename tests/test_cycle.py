@@ -5,7 +5,9 @@
 import logging
 import os
 import re
+import xml.etree.ElementTree as ET
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from youtube_helper.account import AccountUnavailable, LoginLapsed, LoginMissing, Subscription
+from youtube_helper.artwork import ArtworkUnavailable
 from youtube_helper.cycle import Cycle
 from youtube_helper.media_library import MediaLibraryUnwritable
 from youtube_helper.state import StateStore
@@ -22,6 +25,7 @@ from youtube_helper.video_fetcher import (
     FetchFailed,
     NotAiredYet,
     NotRegularVideo,
+    VideoMetadata,
     VideoUnavailable,
 )
 
@@ -95,7 +99,7 @@ class FakeFetcher:
         self.media_library: Path | None = None
         self.disk: FakeDisk | None = None
 
-    def fetch(self, video_id: str, base: Path) -> None:
+    def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         self.fetched.append(video_id)
         if self.disk is not None:
             self.disk.free -= GIB
@@ -106,6 +110,19 @@ class FakeFetcher:
             raise self.errors[video_id]
         base.with_name(base.name + ".mkv").write_bytes(f"video {video_id}".encode())
         base.with_name(base.name + "-thumb.jpg").write_bytes(f"thumb {video_id}".encode())
+        return VideoMetadata(description=f"Description of {video_id}")
+
+
+class FakeArtwork:
+    """Answers each image URL with made-up image data, or raises the error set for it."""
+
+    def __init__(self) -> None:
+        self.errors: dict[str, Exception] = {}
+
+    def download(self, url: str) -> bytes:
+        if url in self.errors:
+            raise self.errors[url]
+        return f"image {url}".encode()
 
 
 def media_files(media_library: Path) -> list[Path]:
@@ -116,6 +133,31 @@ def media_files(media_library: Path) -> list[Path]:
         if path.is_file()
         and not any(part.startswith(".") for part in path.relative_to(media_library).parts)
     )
+
+
+def videos(media_library: Path) -> list[Path]:
+    """Every video file in the Media library."""
+    return [path for path in media_files(media_library) if path.suffix == ".mkv"]
+
+
+def nfo(path: Path) -> tuple[str, dict[str, str]]:
+    """An NFO file's root element and the text of each child, `uniqueid` with its type."""
+    root = ET.parse(path).getroot()
+    fields = {}
+    for child in root:
+        key = f"uniqueid {child.get('type')}" if child.tag == "uniqueid" else child.tag
+        fields[key] = child.text or ""
+    return root.tag, fields
+
+
+def episode_numbers(media_library: Path) -> dict[str, tuple[str, str]]:
+    """Each filed video's ID with the season and episode number from its NFO."""
+    numbers = {}
+    for path in media_library.rglob("*.nfo"):
+        tag, fields = nfo(path)
+        if tag == "episodedetails":
+            numbers[fields["uniqueid youtube"]] = (fields["season"], fields["episode"])
+    return numbers
 
 
 @pytest.fixture
@@ -133,6 +175,11 @@ def fetcher() -> FakeFetcher:
     return FakeFetcher()
 
 
+@pytest.fixture
+def artwork() -> FakeArtwork:
+    return FakeArtwork()
+
+
 @pytest.fixture(autouse=True)
 def info_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO)
@@ -146,6 +193,7 @@ def run_cycle(
     *,
     feed: FakeFeed | None = None,
     fetcher: FakeFetcher | None = None,
+    artwork: FakeArtwork | None = None,
     disk: FakeDisk | None = None,
     timezone: ZoneInfo = UTC_ZONE,
 ) -> None:
@@ -155,6 +203,7 @@ def run_cycle(
         account=account,
         feed=feed or FakeFeed(),
         fetcher=fetcher or FakeFetcher(),
+        artwork=artwork or FakeArtwork(),
         timezone=timezone,
         clock=clock or FakeClock(),
         free_space=disk or FakeDisk(),
@@ -365,6 +414,9 @@ def test_new_upload_lands_in_its_channel_folder_named_by_release_time_in_local_t
     assert media_files(media_library) == [
         Path("First Channel", "Season 2026", f"{basename}-thumb.jpg"),
         Path("First Channel", "Season 2026", f"{basename}.mkv"),
+        Path("First Channel", "Season 2026", f"{basename}.nfo"),
+        Path("First Channel", "poster.jpg"),
+        Path("First Channel", "tvshow.nfo"),
     ]
     video = media_library / "First Channel" / "Season 2026" / f"{basename}.mkv"
     assert video.read_bytes() == b"video vid00000001"
@@ -445,7 +497,7 @@ def test_overlong_title_is_shortened_to_fit_a_filename(
 
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
-    [_, video] = media_files(media_library)
+    [video] = videos(media_library)
     assert video.name.endswith(" [vid00000001].mkv")
     assert len(video.name.replace(".mkv", "-thumb.jpg").encode()) <= 255
 
@@ -477,7 +529,7 @@ def test_failed_download_leaves_nothing_in_the_media_library_and_is_retried(
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001", "vid00000001"]
-    assert len(media_files(media_library)) == 2
+    assert len(videos(media_library)) == 1
 
 
 def test_video_appears_under_its_final_name_only_once_complete(
@@ -492,7 +544,7 @@ def test_video_appears_under_its_final_name_only_once_complete(
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.library_during_fetch == []
-    assert len(media_files(media_library)) == 2
+    assert len(videos(media_library)) == 1
 
 
 def test_unreadable_feed_is_retried_next_cycle_while_other_channels_go_on(
@@ -544,6 +596,254 @@ def test_upload_left_pending_before_an_unsubscribe_is_not_fetched_after_resubscr
     assert media_files(media_library) == []
 
 
+def test_new_upload_gets_an_episode_nfo_next_to_it(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    released = START + timedelta(hours=11, minutes=30)
+    feed.publish("UC1", Upload("vid00000001", "Tom & Jerry <live>", released))
+    clock.advance(timedelta(hours=12))
+
+    run_cycle(
+        media_library,
+        state,
+        account,
+        clock,
+        feed=feed,
+        fetcher=fetcher,
+        timezone=ZoneInfo("Europe/Berlin"),
+    )
+
+    # 23:30 UTC is already the next day in Berlin.
+    basename = "First Channel - 2026-10-17 01-30 - Tom & Jerry _live_ [vid00000001]"
+    assert nfo(media_library / "First Channel" / "Season 2026" / f"{basename}.nfo") == (
+        "episodedetails",
+        {
+            "title": "Tom & Jerry <live>",
+            "plot": "Description of vid00000001",
+            "aired": "2026-10-17",
+            "season": "2026",
+            "episode": "1",
+            "uniqueid youtube": "vid00000001",
+        },
+    )
+
+
+def test_episodes_are_numbered_per_channel_in_release_order_across_cycles(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST, SECOND)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    feed.publish("UC2", Upload("vid00000002", "Other channel", START + timedelta(minutes=6)))
+    feed.publish("UC1", Upload("vid00000003", "Two", START + timedelta(minutes=7)))
+    feed.publish("UC1", Upload("vid00000004", "Three", START + timedelta(minutes=8)))
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000005", "Four", START + timedelta(minutes=40)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "1"),
+        "vid00000002": ("2026", "1"),
+        "vid00000003": ("2026", "2"),
+        "vid00000004": ("2026", "3"),
+        "vid00000005": ("2026", "4"),
+    }
+
+
+def test_each_new_season_starts_at_episode_one(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    new_year = datetime(2027, 1, 1, tzinfo=UTC)
+    feed.publish("UC1", Upload("vid00000001", "Autumn", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "New Year's Eve", new_year - timedelta(minutes=1)))
+    clock.now = new_year
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000003", "New Year", new_year + timedelta(minutes=1)))
+    feed.publish("UC1", Upload("vid00000004", "January", new_year + timedelta(days=1)))
+    clock.advance(timedelta(days=2))
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "1"),
+        "vid00000002": ("2026", "2"),
+        "vid00000003": ("2027", "1"),
+        "vid00000004": ("2027", "2"),
+    }
+    assert {video.parent.name for video in videos(media_library)} == {
+        "Season 2026",
+        "Season 2027",
+    }
+
+
+def test_video_arriving_late_gets_the_next_number_and_nothing_is_renumbered(
+    media_library: Path, state_dir: Path, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        feed.publish("UC1", Upload("vid00000001", "Early", START + timedelta(minutes=5)))
+        feed.publish("UC1", Upload("vid00000002", "Newer", START + timedelta(minutes=20)))
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    # A premiere released between the two shows up only later; a restart happens in between.
+    feed.publish("UC1", Upload("vid00000003", "Premiere", START + timedelta(minutes=10)))
+    clock.advance()
+
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "1"),
+        "vid00000002": ("2026", "2"),
+        "vid00000003": ("2026", "3"),
+    }
+
+
+def test_video_downloaded_after_a_failure_gets_the_next_number(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Flaky", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=20)))
+    fetcher.errors["vid00000001"] = FetchFailed("HTTP Error 503")
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    del fetcher.errors["vid00000001"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "2"),
+        "vid00000002": ("2026", "1"),
+    }
+
+
+def test_channel_folder_gets_a_tvshow_nfo_with_its_first_video(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    assert media_files(media_library) == []
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert nfo(media_library / "First Channel" / "tvshow.nfo") == (
+        "tvshow",
+        {"title": "First Channel", "plot": "About First", "uniqueid youtube": "UC1"},
+    )
+
+
+def test_tvshow_nfo_is_written_from_the_last_known_subscription_while_the_login_has_lapsed(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    account.current = [Subscription("UC1", "Renamed Channel", None, "New description")]
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    account.current = LoginLapsed()
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=35)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    # The name stays the one from first sight, like the Channel folder; the plot is current.
+    assert nfo(media_library / "First Channel" / "tvshow.nfo") == (
+        "tvshow",
+        {"title": "First Channel", "plot": "New description", "uniqueid youtube": "UC1"},
+    )
+
+
+def test_channel_folder_gets_the_channel_avatar_as_poster(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    poster = media_library / "First Channel" / "poster.jpg"
+    assert poster.read_bytes() == b"image https://yt3.ggpht.com/UC1"
+
+
+def test_poster_that_cannot_be_downloaded_is_tried_again_next_cycle(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    artwork: FakeArtwork,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    artwork.errors[FIRST.avatar_url or ""] = ArtworkUnavailable("HTTP 503")
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+
+    assert "Can't download the poster of First Channel (HTTP 503)" in caplog.text
+    assert Path("First Channel", "poster.jpg") not in media_files(media_library)
+    assert Path("First Channel", "tvshow.nfo") in media_files(media_library)
+    artwork.errors.clear()
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+
+    assert Path("First Channel", "poster.jpg") in media_files(media_library)
+
+
+def test_channel_without_avatar_gets_no_poster(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(THIRD)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC3", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert Path("Third Channel", "tvshow.nfo") in media_files(media_library)
+    assert Path("Third Channel", "poster.jpg") not in media_files(media_library)
+    assert "poster" not in caplog.text
+
+
+def test_tvshow_nfo_follows_a_changed_channel_description(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    account.current = [replace(FIRST, description="About First, revised")]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["plot"] == "About First, revised"
+
+
 def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_space_returns(
     media_library: Path,
     state: StateStore,
@@ -578,7 +878,7 @@ def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_spac
 
     assert "no more downloads" not in caplog.text
     assert fetcher.fetched == ["vid00000001"]
-    assert len(media_files(media_library)) == 2
+    assert len(videos(media_library)) == 1
 
 
 def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle(
@@ -608,6 +908,93 @@ def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
 
     assert sorted(fetcher.fetched) == ["vid00000001", "vid00000002", "vid00000003"]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["a Short", "a scheduled live stream", "a running live stream", "a livestream recording"],
+)
+def test_videos_that_are_not_regular_are_excluded_and_never_evaluated_again(
+    media_library: Path,
+    state_dir: Path,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    account = FakeAccount(FIRST)
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        feed.publish("UC1", Upload("vid00000001", "Not regular", START + timedelta(minutes=5)))
+        fetcher.errors["vid00000001"] = NotRegularVideo(kind)
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    # A restart in between: a new process on the same state file.
+    with closing(StateStore.open(state_dir)) as state:
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001"]
+    assert media_files(media_library) == []
+    assert caplog.text.count(f"Excluded Not regular (vid00000001): {kind}") == 1
+    assert "failed" not in caplog.text
+
+
+def test_premiere_is_skipped_while_upcoming_and_downloaded_once_aired(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Premiere", START + timedelta(minutes=5)))
+    fetcher.errors["vid00000001"] = NotAiredYet("upcoming")
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert media_files(media_library) == []
+    assert "Premiere (vid00000001) has not aired yet (upcoming)" in caplog.text
+    assert "failed" not in caplog.text
+    del fetcher.errors["vid00000001"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001"] * 3
+    basename = "First Channel - 2026-10-16 12-05 - Premiere [vid00000001]"
+    assert Path("First Channel", "Season 2026", f"{basename}.mkv") in media_files(media_library)
+
+
+def test_videos_not_downloaded_take_no_episode_number(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Short", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Premiere", START + timedelta(minutes=6)))
+    feed.publish("UC1", Upload("vid00000003", "Regular", START + timedelta(minutes=7)))
+    fetcher.errors["vid00000001"] = NotRegularVideo("a Short")
+    fetcher.errors["vid00000002"] = NotAiredYet("upcoming")
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    del fetcher.errors["vid00000002"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000002": ("2026", "2"),
+        "vid00000003": ("2026", "1"),
+    }
 
 
 def new_upload_failing_with(
@@ -713,7 +1100,7 @@ def test_bot_check_is_called_out_and_retried(
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001", "vid00000002", "vid00000001"]
-    assert len(media_files(media_library)) == 4
+    assert len(videos(media_library)) == 2
 
 
 def test_cycle_where_every_download_fails_says_once_that_yt_dlp_is_likely_outdated(
@@ -752,7 +1139,7 @@ def test_cycle_where_every_download_fails_says_once_that_yt_dlp_is_likely_outdat
 
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
-    assert len(media_files(media_library)) == 6
+    assert len(videos(media_library)) == 3
     assert "outdated" not in caplog.text
 
 
@@ -814,70 +1201,6 @@ def test_failing_writes_to_the_media_library_do_not_blame_yt_dlp(
     assert "outdated" not in caplog.text
 
 
-@pytest.mark.parametrize(
-    "kind",
-    ["a Short", "a scheduled live stream", "a running live stream", "a livestream recording"],
-)
-def test_videos_that_are_not_regular_are_excluded_and_never_evaluated_again(
-    media_library: Path,
-    state_dir: Path,
-    clock: FakeClock,
-    feed: FakeFeed,
-    fetcher: FakeFetcher,
-    caplog: pytest.LogCaptureFixture,
-    kind: str,
-) -> None:
-    account = FakeAccount(FIRST)
-    with closing(StateStore.open(state_dir)) as state:
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-        feed.publish("UC1", Upload("vid00000001", "Not regular", START + timedelta(minutes=5)))
-        fetcher.errors["vid00000001"] = NotRegularVideo(kind)
-        clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-        clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-
-    # A restart in between: a new process on the same state file.
-    with closing(StateStore.open(state_dir)) as state:
-        clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-
-    assert fetcher.fetched == ["vid00000001"]
-    assert media_files(media_library) == []
-    assert caplog.text.count(f"Excluded Not regular (vid00000001): {kind}") == 1
-    assert "failed" not in caplog.text
-
-
-def test_premiere_is_skipped_while_upcoming_and_downloaded_once_aired(
-    media_library: Path,
-    state: StateStore,
-    clock: FakeClock,
-    feed: FakeFeed,
-    fetcher: FakeFetcher,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-    feed.publish("UC1", Upload("vid00000001", "Premiere", START + timedelta(minutes=5)))
-    fetcher.errors["vid00000001"] = NotAiredYet("upcoming")
-    clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-    clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-
-    assert media_files(media_library) == []
-    assert "Premiere (vid00000001) has not aired yet (upcoming)" in caplog.text
-    assert "failed" not in caplog.text
-    del fetcher.errors["vid00000001"]
-    clock.advance()
-
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-
-    assert fetcher.fetched == ["vid00000001"] * 3
-    basename = "First Channel - 2026-10-16 12-05 - Premiere [vid00000001]"
-    assert Path("First Channel", "Season 2026", f"{basename}.mkv") in media_files(media_library)
-
-
 def test_videos_not_to_be_downloaded_neither_hide_nor_count_as_failing_downloads(
     media_library: Path,
     state: StateStore,
@@ -917,4 +1240,4 @@ def test_videos_not_to_be_downloaded_neither_hide_nor_count_as_failing_downloads
         "vid00000003",
         "vid00000003",
     ]
-    assert len(media_files(media_library)) == 4
+    assert len(videos(media_library)) == 2
