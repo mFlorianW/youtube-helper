@@ -5,15 +5,10 @@
 """The daemon: runs one Cycle every 30 minutes until stopped or it can no longer continue."""
 
 import logging
-import os
-import signal
-import sys
 import time
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from datetime import timedelta
-from types import FrameType
-from typing import NoReturn
 
 from youtube_helper.config import ConfigError, load_config
 from youtube_helper.cycle import Cycle
@@ -44,19 +39,3 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
     except (ConfigError, MediaLibraryUnwritable, StateUnavailable) as error:
         log.error("%s", error)
         return 1
-
-
-def _stop(signum: int, frame: FrameType | None) -> NoReturn:
-    log.info("Stopping")
-    sys.exit(0)
-
-
-def cli() -> NoReturn:
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    # As PID 1 in a container, SIGTERM is ignored unless handled explicitly.
-    signal.signal(signal.SIGTERM, _stop)
-    sys.exit(run_daemon(os.environ))

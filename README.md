@@ -21,8 +21,12 @@ cp examples/compose.yaml /srv/youtube-helper/compose.yaml
 # write the Google OAuth client ID and secret into secrets/google_client_id and
 # secrets/google_client_secret, then:
 docker compose -f /srv/youtube-helper/compose.yaml up -d
+docker compose -f /srv/youtube-helper/compose.yaml run --rm youtube-helper login
 docker compose -f /srv/youtube-helper/compose.yaml logs -f
 ```
+
+How to get the client ID and secret and what `login` does is explained in
+[Logging in](#logging-in).
 
 ### With Docker Swarm
 
@@ -30,6 +34,62 @@ To keep the Google client ID and secret in Swarm's encrypted secret store rather
 on the host, deploy [`examples/stack.yaml`](examples/stack.yaml) as a stack on a single-node
 swarm. The file's header lists the `docker secret create` and `docker stack deploy` commands.
 The image and the settings are the same as with plain Compose.
+
+## Logging in
+
+youtube-helper reads your Subscriptions with your own Google account. It needs an OAuth client
+that you create once in Google Cloud, and a one-time `login` that you approve from your phone or
+any other device with a browser. Until then the daemon logs ``Not logged in, run `login` `` every
+cycle and downloads nothing.
+
+### 1. Create the OAuth client
+
+1. Open the [Google Cloud console](https://console.cloud.google.com/) and create a new project,
+   e.g. `youtube-helper`.
+2. Under **APIs & Services → Library**, search for **YouTube Data API v3** and click **Enable**.
+3. Under **Google Auth Platform** (formerly **OAuth consent screen**), click **Get started**:
+   enter an app name and your email address, choose the audience **External**, and finish.
+4. Under **Audience**, click **Publish app** so the publishing status becomes **In production**.
+   Leave the app unverified; verification is only needed for apps used by other people.
+   An app left in *Testing* gets refresh tokens that expire after 7 days, so you would have to
+   log in again every week.
+5. Under **Clients**, click **Create client**, choose the application type
+   **TVs and Limited Input devices**, give it a name and click **Create**. Copy the client ID
+   (`…apps.googleusercontent.com`) and the client secret.
+
+### 2. Store the ID and secret as secrets
+
+The ID and secret are passed to the container as the secrets `google_client_id` and
+`google_client_secret` (see [Configuration](#configuration)). With
+[`examples/compose.yaml`](examples/compose.yaml) they are files next to the compose file:
+
+```sh
+cd /srv/youtube-helper
+printf '%s' '<client id>' > secrets/google_client_id
+printf '%s' '<client secret>' > secrets/google_client_secret
+chown 1000:1000 secrets/*   # the `user:` from compose.yaml
+chmod 600 secrets/*
+```
+
+For Swarm, create them with `docker secret create` as described in
+[`examples/stack.yaml`](examples/stack.yaml).
+
+### 3. Run `login`
+
+```sh
+docker compose -f /srv/youtube-helper/compose.yaml run --rm youtube-helper login
+```
+
+`login` prints a web address and a code. Open the address on your phone, sign in with the Google
+account whose Subscriptions you want, enter the code and allow read-only access to your YouTube
+account. Because the app is unverified, Google first warns that it hasn't verified the app:
+it is your own app, so choose **Advanced → Go to youtube-helper (unsafe)**.
+
+`login` waits until you have approved, stores the resulting refresh token in the state
+database and confirms with `Logged in`. A running daemon picks the login up at its next cycle;
+there is no need to restart it. If you deny access or don't approve before the code expires
+(after about 30 minutes), `login` says so and exits non-zero; just run it again. Running it
+again later replaces the stored login, e.g. after you revoked access in your Google account.
 
 ## Configuration
 

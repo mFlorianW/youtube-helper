@@ -43,3 +43,21 @@ def test_cycle_with_missing_media_library_fails_naming_the_directory(
 
     with pytest.raises(MediaLibraryUnwritable, match=re.escape(str(missing))):
         Cycle(missing, state).run()
+
+
+def test_cycle_without_login_asks_for_login(
+    media_library: Path, state: StateStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    Cycle(media_library, state).run()
+
+    assert "Not logged in, run `login`" in caplog.text
+
+
+def test_cycle_after_login_does_not_ask_for_login(
+    media_library: Path, state: StateStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    state.save_refresh_token("refresh-token")
+
+    Cycle(media_library, state).run()
+
+    assert "Not logged in" not in caplog.text

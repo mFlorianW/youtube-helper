@@ -18,6 +18,9 @@
 # Deploy and follow the logs:
 #   docker stack deploy -c stack.yaml youtube-helper
 #   docker service logs -f youtube-helper_youtube-helper
+# Log in once (see "Logging in" in the README). The secrets are only available to the
+# service's own container, so run `login` inside it:
+#   docker exec -it $(docker ps -q -f name=youtube-helper_youtube-helper) youtube-helper login
 #
 # A Swarm secret can't be changed in place. To replace one, remove the stack (or the
 # secret from the service), `docker secret rm` it, create it again and redeploy.
