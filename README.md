@@ -13,7 +13,8 @@ A media server such as Jellyfin can scan the Media library; youtube-helper knows
 
 youtube-helper runs as its own Docker Compose project. Start from
 [`examples/compose.yaml`](examples/compose.yaml): every setting there is commented, and the values
-to adjust are marked `adjust`.
+to adjust are marked `adjust`. [`examples/compose.minimal.yaml`](examples/compose.minimal.yaml)
+has the same setup without the comments and log rotation, if you'd rather start small.
 
 ```sh
 mkdir -p /srv/youtube-helper/secrets /srv/youtube-helper/state
