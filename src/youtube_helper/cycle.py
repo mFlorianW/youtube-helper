@@ -77,16 +77,17 @@ class Cycle:
             return
         self._state.record_uploads(
             subscription.channel_id,
-            (u for u in uploads if u.released > subscription.tracking_start),
+            (u for u in uploads if subscription.tracks(u)),
         )
 
     def _download_new_uploads(self, subscription: TrackedSubscription) -> None:
-        folder = channel_folder(subscription.display_name, subscription.channel_id)
         for upload in self._state.pending_uploads(subscription.channel_id):
             # Uploads left pending before an unsubscribe fall into the gap: never fetched.
-            if upload.released <= subscription.tracking_start:
+            if not subscription.tracks(upload):
                 continue
-            base = video_base(self._media_library, folder, upload, self._timezone)
+            base = video_base(
+                self._media_library, subscription.channel_folder, upload, self._timezone
+            )
             log.info("Downloading %s (%s)", upload.title, upload.video_id)
             try:
                 with staged(self._media_library, upload.video_id) as staged_base:
@@ -135,6 +136,9 @@ class Cycle:
                 tracked = TrackedSubscription(
                     channel_id=subscription.channel_id,
                     display_name=subscription.display_name,
+                    channel_folder=channel_folder(
+                        subscription.display_name, subscription.channel_id
+                    ),
                     active=True,
                     tracking_start=now,
                 )
