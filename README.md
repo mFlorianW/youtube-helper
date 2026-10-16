@@ -91,6 +91,18 @@ there is no need to restart it. If you deny access or don't approve before the c
 (after about 30 minutes), `login` says so and exits non-zero; just run it again. Running it
 again later replaces the stored login, e.g. after you revoked access in your Google account.
 
+## Subscriptions
+
+Every cycle the daemon reads all your current Subscriptions from your Google account and logs
+the active ones. Tracking a Subscription starts when the daemon first sees it, so on the very
+first start nothing older than that is fetched; the same goes for a channel you subscribe to
+later. When you unsubscribe, the channel stops being tracked but its files stay in the Media
+library. When you subscribe again, tracking restarts from that moment and the gap is left alone.
+
+If Google no longer accepts the login, e.g. because you revoked access, the daemon logs
+``Login has lapsed, run `login` again`` every cycle and keeps using the Subscriptions it last
+saw until you run `login` again.
+
 ## Configuration
 
 All configuration is passed to the container by Compose. There is no config file.

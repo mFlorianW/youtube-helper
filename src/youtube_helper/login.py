@@ -19,14 +19,20 @@ from typing import Any
 import httpx
 
 from youtube_helper.config import load_state_dir
+from youtube_helper.google import (
+    HTTP_TIMEOUT,
+    SECRETS_DIR,
+    TOKEN_URL,
+    ClientCredentials,
+    CredentialsUnavailable,
+    UnexpectedResponse,
+    describe_oauth_error,
+    read_client_credentials,
+    send,
+)
 from youtube_helper.state import StateStore, StateUnavailable
 
-SECRETS_DIR = Path("/run/secrets")
-CLIENT_ID_SECRET = "google_client_id"
-CLIENT_SECRET_SECRET = "google_client_secret"
-
 DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
-TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 
@@ -34,17 +40,9 @@ DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 DEFAULT_POLL_INTERVAL = 5
 SLOW_DOWN_STEP = 5
 
-HTTP_TIMEOUT = 30
-
 
 class LoginFailed(Exception):
     pass
-
-
-@dataclass(frozen=True)
-class ClientCredentials:
-    client_id: str
-    client_secret: str
 
 
 @dataclass(frozen=True)
@@ -80,7 +78,7 @@ def run_login(
                     client, credentials, authorization, sleep=sleep, clock=clock
                 )
             state.save_refresh_token(refresh_token)
-    except (LoginFailed, StateUnavailable) as error:
+    except (LoginFailed, CredentialsUnavailable, StateUnavailable) as error:
         print(f"Login failed: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -90,27 +88,10 @@ def run_login(
     return 0
 
 
-def read_client_credentials(secrets_dir: Path) -> ClientCredentials:
-    return ClientCredentials(
-        _read_secret(secrets_dir / CLIENT_ID_SECRET),
-        _read_secret(secrets_dir / CLIENT_SECRET_SECRET),
-    )
-
-
-def _read_secret(path: Path) -> str:
-    try:
-        value = path.read_text().strip()
-    except OSError as error:
-        raise LoginFailed(f"can't read secret {path}: {error.strerror or error}") from error
-    if not value:
-        raise LoginFailed(f"secret {path} is empty")
-    return value
-
-
 def request_device_code(http: httpx.Client, credentials: ClientCredentials) -> DeviceAuthorization:
     body = _post(http, DEVICE_CODE_URL, {"client_id": credentials.client_id, "scope": SCOPE})
     if "error" in body:
-        raise LoginFailed(f"Google refused the device code request: {_describe_error(body)}")
+        raise LoginFailed(f"Google refused the device code request: {describe_oauth_error(body)}")
     try:
         return DeviceAuthorization(
             device_code=str(body["device_code"]),
@@ -162,7 +143,7 @@ def poll_for_refresh_token(
             case "expired_token":
                 raise _expired()
             case _:
-                raise LoginFailed(f"Google refused the login: {_describe_error(body)}")
+                raise LoginFailed(f"Google refused the login: {describe_oauth_error(body)}")
         if clock() >= deadline:
             raise _expired()
 
@@ -174,18 +155,7 @@ def _expired() -> LoginFailed:
 def _post(http: httpx.Client, url: str, data: dict[str, str]) -> dict[str, Any]:
     """POST a form and return the JSON object Google answers with, error responses included."""
     try:
-        response = http.post(url, data=data)
-    except httpx.HTTPError as error:
-        raise LoginFailed(f"can't reach {url}: {error}") from error
-    try:
-        body = response.json()
-    except ValueError:
-        body = None
-    if not isinstance(body, dict):
-        raise LoginFailed(f"unexpected response from {url}: HTTP {response.status_code}")
+        _, body = send(http, http.build_request("POST", url, data=data))
+    except UnexpectedResponse as error:
+        raise LoginFailed(str(error)) from error
     return body
-
-
-def _describe_error(body: Mapping[str, Any]) -> str:
-    description = body.get("error_description")
-    return f"{body['error']} ({description})" if description else str(body["error"])

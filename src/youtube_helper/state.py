@@ -5,6 +5,9 @@
 """The SQLite state store that keeps all tool state in one file under the state directory."""
 
 import sqlite3
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Self
 
@@ -14,12 +17,30 @@ DATABASE_NAME = "youtube-helper.sqlite3"
 # Append only: never edit or reorder an entry once it has been released.
 MIGRATIONS = (
     "CREATE TABLE login (id INTEGER PRIMARY KEY CHECK (id = 1), refresh_token TEXT NOT NULL)",
+    "CREATE TABLE subscription ("
+    " channel_id TEXT PRIMARY KEY,"
+    " display_name TEXT NOT NULL,"
+    " active INTEGER NOT NULL,"
+    " tracking_start TEXT NOT NULL)",
 )
 
 
 class StateUnavailable(Exception):
     def __init__(self, path: Path, reason: sqlite3.Error) -> None:
         super().__init__(f"State database {path} can't be opened: {reason}")
+
+
+@dataclass(frozen=True)
+class TrackedSubscription:
+    """A Subscription as the tool knows it: inactive once the owner has unsubscribed.
+
+    The display name is the one from first sight; later renames don't change it.
+    """
+
+    channel_id: str
+    display_name: str
+    active: bool
+    tracking_start: datetime
 
 
 class StateStore:
@@ -52,6 +73,35 @@ class StateStore:
                 "INSERT INTO login (id, refresh_token) VALUES (1, ?)"
                 " ON CONFLICT (id) DO UPDATE SET refresh_token = excluded.refresh_token",
                 (refresh_token,),
+            )
+
+    def tracked_subscriptions(self) -> list[TrackedSubscription]:
+        """Every Subscription ever seen, active or not, in the order first seen."""
+        rows = self._connection.execute(
+            "SELECT channel_id, display_name, active, tracking_start FROM subscription"
+            " ORDER BY rowid"
+        )
+        return [
+            TrackedSubscription(
+                channel_id, display_name, bool(active), datetime.fromisoformat(start)
+            )
+            for channel_id, display_name, active, start in rows
+        ]
+
+    def save_tracked_subscriptions(self, subscriptions: Iterable[TrackedSubscription]) -> None:
+        """Insert or replace these Subscriptions, all at once."""
+        with self._connection:
+            self._connection.executemany(
+                "INSERT INTO subscription (channel_id, display_name, active, tracking_start)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (channel_id) DO UPDATE SET"
+                " display_name = excluded.display_name,"
+                " active = excluded.active,"
+                " tracking_start = excluded.tracking_start",
+                [
+                    (s.channel_id, s.display_name, s.active, s.tracking_start.isoformat())
+                    for s in subscriptions
+                ],
             )
 
 
