@@ -124,6 +124,10 @@ yt-dlp (never with your Google cookies) and filed into the Media library:
   are moved into place only when complete, so a media server never sees a half-finished file.
 - Each video is downloaded once, also across restarts. A failed download is tried again the
   next cycle.
+- Before each download the daemon checks the free space in the Media library. Below 10 GiB it
+  logs `Only … GiB free in the Media library …` and downloads nothing more that cycle. The New
+  uploads stay pending and are downloaded automatically once there is enough space again;
+  Subscriptions and upload feeds are still read in the meantime.
 
 ## Configuration
 
