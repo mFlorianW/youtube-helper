@@ -21,7 +21,15 @@ THUMBNAIL_SUFFIX = "-thumb.jpg"
 
 
 class FetchFailed(Exception):
-    """The video couldn't be downloaded."""
+    """The video couldn't be downloaded this time; trying again later may work."""
+
+
+class BotCheck(FetchFailed):
+    """YouTube asked to confirm that the download isn't made by a bot; may pass later."""
+
+
+class VideoUnavailable(FetchFailed):
+    """The video can never be downloaded: removed, private, members-only or age-gated."""
 
 
 class NotRegularVideo(Exception):
@@ -45,7 +53,8 @@ class VideoFetcher(Protocol):
 
         Only regular videos are downloaded: raises NotRegularVideo for a Short or a livestream,
         NotAiredYet for a premiere that hasn't aired yet. The thumbnail may be missing if YouTube
-        has none. Returns what the episode NFO needs; raises FetchFailed when the download fails.
+        has none. Returns what the episode NFO needs. Raises VideoUnavailable if the video can
+        never be downloaded, BotCheck if YouTube asked for a bot check, FetchFailed otherwise.
         """
         ...
 
@@ -64,7 +73,7 @@ class YtDlpFetcher:
             with yt_dlp.YoutubeDL(_options(base)) as ydl:
                 info = ydl.extract_info(WATCH_URL + video_id, download=True)
         except YoutubeDLError as error:
-            raise FetchFailed(str(error)) from error
+            raise _classify(str(error)) from error
         if not base.with_name(base.name + VIDEO_SUFFIX).is_file():
             raise FetchFailed(f"yt-dlp produced no {VIDEO_SUFFIX} file")
         return VideoMetadata(description=str(info.get("description") or ""))
@@ -88,6 +97,42 @@ def _ensure_regular(info: dict[str, Any]) -> None:
         raise NotAiredYet("upcoming")
     if live_status in ("is_live", "post_live"):
         raise NotAiredYet("still airing")
+
+
+# Fragments of YouTube's reasons, as yt-dlp passes them on, lower-cased.
+_BOT_CHECK_REASONS = ("not a bot", "captcha")
+# YouTube's rate limit also starts with "Video unavailable", but passes.
+_TEMPORARY_REASONS = ("try again later",)
+_PERMANENT_REASONS = (
+    # removed
+    "video unavailable",
+    "has been removed",
+    "no longer available",
+    "has been terminated",
+    "copyright",
+    # private
+    "private video",
+    "video is private",
+    # members-only
+    "members-only",
+    "join this channel",
+    # age-gated
+    "confirm your age",
+    "age-restricted",
+    "inappropriate for some users",
+)
+
+
+def _classify(message: str) -> FetchFailed:
+    """The FetchFailed fitting yt-dlp's error `message`."""
+    reason = message.lower()
+    if any(fragment in reason for fragment in _BOT_CHECK_REASONS):
+        return BotCheck(message)
+    if any(fragment in reason for fragment in _TEMPORARY_REASONS):
+        return FetchFailed(message)
+    if any(fragment in reason for fragment in _PERMANENT_REASONS):
+        return VideoUnavailable(message)
+    return FetchFailed(message)
 
 
 def _options(base: Path) -> dict[str, Any]:
