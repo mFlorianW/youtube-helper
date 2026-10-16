@@ -48,16 +48,19 @@ soon fails every download, so updates reach the host without manual work:
 2. CI checks that yt-dlp in the built image finds Deno and yt-dlp-ejs. Every merge to `main`
    publishes the image as `ghcr.io/mflorianw/youtube-helper:latest`.
 3. On the host, a daily job runs `docker compose pull && docker compose up -d` in the
-   compose project's directory. It recreates the container only if a new image was pulled.
+   compose project's directory. It recreates the container only if a new image was pulled,
+   then runs `docker image prune --force` to remove the image it replaced.
 
 For step 3, install either the systemd timer or the cron job from
 [`examples/update/`](examples/update/); each file's header says how. Adjust the directory if
 your `compose.yaml` isn't in `/srv/youtube-helper`.
 
-A yt-dlp fix thus usually reaches the host within a day. Pulled images pile up, so remove old
-ones now and then with `docker image prune`. With Docker Swarm, change the job's commands to
-`docker stack deploy -c stack.yaml youtube-helper`, run in the directory holding `stack.yaml`:
-it pulls `latest` again and updates the service if the image changed.
+A yt-dlp fix thus usually reaches the host within a day. `docker compose pull` keeps the old
+image, untagged; the prune removes it so images don't pile up. It removes every dangling image
+on the host, not only youtube-helper's; drop it from the job if you keep untagged images on
+purpose. With Docker Swarm, change the job's commands to
+`docker stack deploy -c stack.yaml youtube-helper` plus the prune, run in the directory holding
+`stack.yaml`: it pulls `latest` again and updates the service if the image changed.
 
 ## Logging in
 

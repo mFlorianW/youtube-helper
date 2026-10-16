@@ -2,7 +2,8 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-# Pulls the latest youtube-helper image and recreates the container if the image changed.
+# Pulls the latest youtube-helper image, recreates the container if the image changed and
+# removes the image it replaced.
 # Started daily by youtube-helper-update.timer; see "Updates" in the README.
 #
 # Install both files into /etc/systemd/system/, then:
@@ -22,6 +23,8 @@ Wants=network-online.target
 Type=oneshot
 # adjust: the directory holding youtube-helper's compose.yaml.
 WorkingDirectory=/srv/youtube-helper
-# The second command runs only if the first succeeded.
+# Each command runs only if the one before succeeded. The prune removes dangling (untagged)
+# images, which includes the one `pull` replaced.
 ExecStart=/usr/bin/docker compose pull --quiet
 ExecStart=/usr/bin/docker compose up -d
+ExecStart=/usr/bin/docker image prune --force
