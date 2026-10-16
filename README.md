@@ -149,12 +149,26 @@ yt-dlp (never with your Google cookies) and filed into the Media library:
   merged into MKV with metadata and chapters embedded.
 - Downloads go to the hidden `.youtube-helper-staging` directory in the Media library first and
   are moved into place only when complete, so a media server never sees a half-finished file.
-- Each video is downloaded once, also across restarts. A failed download is tried again the
-  next cycle.
+- Each video is downloaded once, also across restarts.
 - Before each download the daemon checks the free space in the Media library. Below 10 GiB it
   logs `Only … GiB free in the Media library …` and downloads nothing more that cycle. The New
   uploads stay pending and are downloaded automatically once there is enough space again;
   Subscriptions and upload feeds are still read in the meantime.
+
+### When downloads fail
+
+- A video that can never be downloaded anonymously (removed, private, members-only or
+  age-restricted) is skipped: the daemon logs `Skipped <title> (<videoid>) for good` once and
+  never tries it again.
+- Any other failure is tried again every cycle. If a video still fails 24 hours after its first
+  failure, the daemon logs `Gave up on <title> (<videoid>) after failing for 24 hours` once and
+  never tries it again.
+- When YouTube asks for a bot check, the daemon says so and tries again next cycle. If this keeps
+  happening, a PO-token provider is needed.
+- When every download of a cycle fails (videos skipped for good aside), yt-dlp has most likely
+  fallen behind a change on YouTube's side. Instead of one error per video, the daemon then logs
+  a single `All downloads failing …; yt-dlp is likely outdated, pull the latest image`. Pulling
+  the latest image brings the newest yt-dlp; the videos are tried again on the next cycle.
 
 ## Configuration
 

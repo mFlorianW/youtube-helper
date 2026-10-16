@@ -46,6 +46,8 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     " status TEXT NOT NULL)",
     "ALTER TABLE subscription ADD COLUMN channel_folder TEXT NOT NULL DEFAULT ''",
     _name_channel_folders,
+    "ALTER TABLE video ADD COLUMN last_error TEXT",
+    "ALTER TABLE video ADD COLUMN first_failure TEXT",
 )
 
 
@@ -172,6 +174,31 @@ class StateStore:
         with self._connection:
             self._connection.execute(
                 "UPDATE video SET status = 'downloaded' WHERE video_id = ?", (video_id,)
+            )
+
+    def mark_skipped(self, video_id: str, error: str) -> None:
+        """Remember that the video can never be downloaded, so it is never tried again."""
+        with self._connection:
+            self._connection.execute(
+                "UPDATE video SET status = 'skipped', last_error = ? WHERE video_id = ?",
+                (error, video_id),
+            )
+
+    def record_failure(self, video_id: str, error: str, at: datetime) -> datetime:
+        """Remember that downloading the video failed at `at`; return when it first failed."""
+        with self._connection:
+            (first_failure,) = self._connection.execute(
+                "UPDATE video SET last_error = ?, first_failure = COALESCE(first_failure, ?)"
+                " WHERE video_id = ? RETURNING first_failure",
+                (error, at.astimezone(UTC).isoformat(), video_id),
+            ).fetchone()
+        return datetime.fromisoformat(first_failure)
+
+    def mark_failed(self, video_id: str) -> None:
+        """Remember that the video kept failing for too long, so it is never tried again."""
+        with self._connection:
+            self._connection.execute(
+                "UPDATE video SET status = 'failed' WHERE video_id = ?", (video_id,)
             )
 
 
