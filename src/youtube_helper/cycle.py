@@ -109,7 +109,6 @@ class Cycle:
                             title=upload.title,
                             plot=metadata.description,
                             aired=aired,
-                            season=aired.year,
                             episode=episode,
                             video_id=upload.video_id,
                         )
@@ -129,29 +128,30 @@ class Cycle:
             log.info("Downloaded %s", base.relative_to(self._media_library))
 
     def _complete_channel_folder(self, subscription: TrackedSubscription) -> None:
-        """Give a Channel folder holding videos the `tvshow.nfo` and poster it still lacks.
+        """Keep a Channel folder holding videos furnished with its `tvshow.nfo` and poster.
 
-        Each is written once; one that can't be written is tried again next cycle.
+        The `tvshow.nfo` follows the channel's description; the poster is downloaded once.
+        Whatever can't be written is tried again next cycle.
         """
         folder = self._media_library / subscription.channel_folder
         if not folder.is_dir():
             return
         tvshow = folder / TVSHOW_NFO
-        if not tvshow.exists():
-            content = tvshow_nfo(
-                title=subscription.display_name,
-                plot=subscription.description,
-                channel_id=subscription.channel_id,
-            )
-            try:
+        content = tvshow_nfo(
+            title=subscription.display_name,
+            plot=subscription.description,
+            channel_id=subscription.channel_id,
+        )
+        try:
+            if not tvshow.exists() or tvshow.read_bytes() != content:
                 file_atomically(self._media_library, tvshow, content)
-            except OSError as error:
-                log.warning(
-                    "Can't write the %s of %s (%s); trying again next cycle",
-                    TVSHOW_NFO,
-                    subscription.display_name,
-                    error,
-                )
+        except OSError as error:
+            log.warning(
+                "Can't write the %s of %s (%s); trying again next cycle",
+                TVSHOW_NFO,
+                subscription.display_name,
+                error,
+            )
         poster = folder / POSTER
         if subscription.avatar_url is not None and not poster.exists():
             try:
@@ -206,25 +206,19 @@ class Cycle:
                 )
                 action = "Started"
             elif not tracked.active:
-                # Keep the name from first sight: the Channel folder never follows a rename.
-                tracked = replace(
-                    tracked,
-                    active=True,
-                    tracking_start=now,
-                    description=subscription.description,
-                    avatar_url=subscription.avatar_url,
-                )
+                tracked = replace(tracked, active=True, tracking_start=now)
                 action = "Restarted"
             else:
-                details = replace(
-                    tracked,
-                    description=subscription.description,
-                    avatar_url=subscription.avatar_url,
-                )
-                if details != tracked:
-                    changed.append(details)
+                action = None
+            # Keep the name from first sight: the Channel folder never follows a rename.
+            # The description and avatar do follow the channel.
+            refreshed = replace(
+                tracked, description=subscription.description, avatar_url=subscription.avatar_url
+            )
+            if refreshed != known.get(subscription.channel_id):
+                changed.append(refreshed)
+            if action is None:
                 continue
-            changed.append(tracked)
             log.info(
                 "%s tracking %s (%s) from %s",
                 action,

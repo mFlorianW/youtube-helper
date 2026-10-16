@@ -13,7 +13,7 @@ _NOT_XML = re.compile(r"[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 
 def tvshow_nfo(*, title: str, plot: str, channel_id: str) -> bytes:
-    """The `tvshow.nfo` that makes a Channel folder one series."""
+    """The `tvshow.nfo` that makes the media server show a Channel folder as one show."""
     return _document(
         "tvshow",
         [("title", title), ("plot", plot)],
@@ -21,17 +21,18 @@ def tvshow_nfo(*, title: str, plot: str, channel_id: str) -> bytes:
     )
 
 
-def episode_nfo(
-    *, title: str, plot: str, aired: date, season: int, episode: int, video_id: str
-) -> bytes:
-    """The `.nfo` next to a video that makes it one episode of its Channel folder's series."""
+def episode_nfo(*, title: str, plot: str, aired: date, episode: int, video_id: str) -> bytes:
+    """The `.nfo` next to a video that makes it one episode of its Channel folder's show.
+
+    Its season is the year it was released (aired).
+    """
     return _document(
         "episodedetails",
         [
             ("title", title),
             ("plot", plot),
             ("aired", aired.isoformat()),
-            ("season", str(season)),
+            ("season", str(aired.year)),
             ("episode", str(episode)),
         ],
         unique_id=video_id,

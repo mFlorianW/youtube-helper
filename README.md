@@ -131,17 +131,19 @@ yt-dlp (never with your Google cookies) and filed into the Media library:
 ### Metadata for the media server
 
 The Media library carries its metadata as NFO files, so Jellyfin (a **Shows** library pointed
-at the Media library) or any other NFO-aware media server shows each Subscription as a series
+at the Media library) or any other NFO-aware media server shows each Subscription as a show
 with its videos in release order, without any plugin:
 
-- `tvshow.nfo` in each Channel folder holds the channel's name, its description and its channel
-  ID; `poster.jpg` is the channel's avatar. Both are written once, together with the channel's
-  first video. If the avatar can't be downloaded, it is tried again every cycle.
+- `tvshow.nfo` in each Channel folder holds the channel's name (the one from first sight, like
+  the Channel folder), its description and its channel ID; `poster.jpg` is the channel's avatar.
+  Both appear with the channel's first video. The description follows the channel; the poster
+  is downloaded once, and tried again every cycle until that succeeds.
 - The `.nfo` next to each video holds its title, description, release date, season (the
   release year) and episode number, and its video ID.
-- Episodes are numbered per Channel folder and season in the order they are downloaded, which
-  is release order; each new year starts again at 1. Numbers never change, so a video that
-  arrives late, e.g. a premiere airing after newer videos, gets the next number.
+- Episodes are numbered per Channel folder and season in the order they are downloaded,
+  normally release order; each new year starts again at 1. Numbers never change, so a video
+  that arrives late, e.g. a premiere airing after newer videos or a video whose download failed
+  at first, gets the next number.
 
 ## Configuration
 

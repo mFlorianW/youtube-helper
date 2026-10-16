@@ -7,6 +7,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -803,3 +804,19 @@ def test_channel_without_avatar_gets_no_poster(
     assert Path("Third Channel", "tvshow.nfo") in media_files(media_library)
     assert Path("Third Channel", "poster.jpg") not in media_files(media_library)
     assert "poster" not in caplog.text
+
+
+def test_tvshow_nfo_follows_a_changed_channel_description(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    account.current = [replace(FIRST, description="About First, revised")]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["plot"] == "About First, revised"
