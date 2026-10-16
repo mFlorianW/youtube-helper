@@ -35,7 +35,8 @@ class VideoFetcher(Protocol):
     def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         """Download the video as `<base>.mkv`, its thumbnail as `<base>-thumb.jpg`.
 
-        The thumbnail may be missing if YouTube has none. Raises FetchFailed otherwise.
+        The thumbnail may be missing if YouTube has none. Returns what the episode NFO needs;
+        raises FetchFailed when the video can't be downloaded.
         """
         ...
 
