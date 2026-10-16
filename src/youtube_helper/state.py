@@ -169,16 +169,16 @@ class StateStore:
 
     def mark_downloaded(self, video_id: str) -> None:
         """Remember that the video is in the Media library, so it is never fetched again."""
-        with self._connection:
-            self._connection.execute(
-                "UPDATE video SET status = 'downloaded' WHERE video_id = ?", (video_id,)
-            )
+        self._set_status(video_id, "downloaded")
 
     def mark_excluded(self, video_id: str) -> None:
         """Remember that the video is not a regular one, so it is never fetched again."""
+        self._set_status(video_id, "excluded")
+
+    def _set_status(self, video_id: str, status: str) -> None:
         with self._connection:
             self._connection.execute(
-                "UPDATE video SET status = 'excluded' WHERE video_id = ?", (video_id,)
+                "UPDATE video SET status = ? WHERE video_id = ?", (status, video_id)
             )
 
 

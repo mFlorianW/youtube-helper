@@ -605,7 +605,10 @@ def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle
     assert sorted(fetcher.fetched) == ["vid00000001", "vid00000002", "vid00000003"]
 
 
-@pytest.mark.parametrize("kind", ["a Short", "a running live stream", "a livestream recording"])
+@pytest.mark.parametrize(
+    "kind",
+    ["a Short", "a scheduled live stream", "a running live stream", "a livestream recording"],
+)
 def test_videos_that_are_not_regular_are_excluded_and_never_evaluated_again(
     media_library: Path,
     state_dir: Path,

@@ -47,13 +47,14 @@ class YtDlpFetcher:
 
     def fetch(self, video_id: str, base: Path) -> None:
         try:
-            # Look before downloading. Without formats to tolerate, an upcoming premiere would
-            # fail extraction before telling what it is.
+            # Look before downloading. Tolerating missing formats lets an upcoming premiere tell
+            # what it is instead of failing; it also hides why formats are missing otherwise, so
+            # the download extracts afresh and fails with the real reason.
             with yt_dlp.YoutubeDL(_options(base) | {"ignore_no_formats_error": True}) as ydl:
                 info = ydl.extract_info(WATCH_URL + video_id, download=False, process=False)
             _ensure_regular(info)
             with yt_dlp.YoutubeDL(_options(base)) as ydl:
-                ydl.process_ie_result(info, download=True)
+                ydl.download([WATCH_URL + video_id])
         except YoutubeDLError as error:
             raise FetchFailed(str(error)) from error
         if not base.with_name(base.name + VIDEO_SUFFIX).is_file():
@@ -68,7 +69,9 @@ def _ensure_regular(info: dict[str, Any]) -> None:
         raise NotRegularVideo("a Short")
     # YouTube marks scheduled, running and recorded live streams alike as live content.
     if media_type == "livestream":
-        if live_status in ("is_live", "is_upcoming", "post_live"):
+        if live_status == "is_upcoming":
+            raise NotRegularVideo("a scheduled live stream")
+        if live_status in ("is_live", "post_live"):
             raise NotRegularVideo("a running live stream")
         raise NotRegularVideo("a livestream recording")
     # Premieres aren't live content, yet are upcoming and then live until they have aired.
