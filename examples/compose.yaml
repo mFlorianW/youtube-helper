@@ -4,36 +4,60 @@
 
 # Example deployment of youtube-helper as its own compose project.
 #
+# Copy this file into an empty directory (e.g. /srv/youtube-helper/compose.yaml) and adjust
+# the values marked "adjust". All configuration lives here; there is no separate config file.
+#
 # Before the first start:
-# - create the host directories for the Media library and the state, writable by the
-#   user below (the tool never changes ownership or permissions);
-# - put the Google OAuth client ID and secret into the two secret files.
+# - create the host directories for the Media library and the state, writable by the user
+#   below (the tool never changes ownership or permissions);
+# - put the Google OAuth client ID and secret into the two secret files (see `secrets:`).
 
 name: youtube-helper
 
 services:
   youtube-helper:
     image: ghcr.io/mflorianw/youtube-helper:latest
+    # Come back after crashes and host reboots, but stay down after `docker compose stop`.
     restart: unless-stopped
-    # The user that owns the Media library and state directories on the host.
+    # adjust: UID:GID that owns the Media library, the state directory and the secret files
+    # on the host (`id -u`, `id -g`). Files the tool writes belong to this user.
     user: "1000:1000"
     environment:
+      # Where the Media library is mounted inside the container (must match `volumes:`).
+      # Required: the daemon refuses to start without it.
       MEDIA_LIBRARY: /media-library
+      # adjust: your local time zone (IANA name). Used for log times and, later, for the
+      # release time in filenames. Defaults to UTC; an unknown name stops the daemon.
       TZ: Europe/Berlin
+      # Where the SQLite state lives inside the container. /state is the default, so this
+      # line is optional; it is shown only to explain the `/state` mount below.
+      STATE_DIR: /state
     volumes:
+      # adjust: host path of the Media library. Point your media server at the same path.
+      # It is checked for writability at startup and before every cycle; if it isn't
+      # writable, the daemon exits with an error naming the directory.
       - /srv/media/youtube:/media-library:rw
+      # adjust: host path for the state database (youtube-helper.sqlite3). Back it up;
+      # losing it means already tracked Subscriptions start over.
       - /srv/youtube-helper/state:/state:rw
+    # Each secret appears read-only as a file /run/secrets/<name> in the container.
     secrets:
       - google_client_id
       - google_client_secret
+    # Logs go to stdout; rotate them so `docker logs` can't fill the disk.
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 
+# Compose (without Swarm) bind-mounts each secret file into the container: it is not
+# encrypted, and the host file's owner and mode apply. Keep the files readable only by the
+# user above, e.g. `chmod 600 secrets/*` after `chown 1000:1000 secrets/*`.
 secrets:
   google_client_id:
+    # A file containing only the OAuth client ID ("…apps.googleusercontent.com").
     file: ./secrets/google_client_id
   google_client_secret:
+    # A file containing only the OAuth client secret.
     file: ./secrets/google_client_secret
