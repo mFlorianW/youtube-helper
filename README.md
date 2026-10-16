@@ -165,8 +165,8 @@ yt-dlp (never with your Google cookies) and filed into the Media library:
   never tries it again.
 - When YouTube asks for a bot check, the daemon says so and tries again next cycle. If this keeps
   happening, a PO-token provider is needed.
-- When every download of a cycle fails (videos skipped for good aside), yt-dlp has most likely
-  fallen behind a change on YouTube's side. Instead of one error per video, the daemon then logs
+- When every download attempt of a cycle fails in yt-dlp and none of the videos was skipped for
+  good, yt-dlp has most likely fallen behind a change on YouTube's side. Instead of one error per video, the daemon then logs
   a single `All downloads failing …; yt-dlp is likely outdated, pull the latest image`. Pulling
   the latest image brings the newest yt-dlp; the videos are tried again on the next cycle.
 

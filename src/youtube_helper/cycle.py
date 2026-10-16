@@ -148,9 +148,10 @@ class Cycle:
         if now - first_failure >= RETRY_PERIOD:
             self._state.mark_failed(upload.video_id)
             log.error(
-                "Gave up on %s (%s) after failing for 24 hours: %s",
+                "Gave up on %s (%s) after failing for %d hours: %s",
                 upload.title,
                 upload.video_id,
+                RETRY_PERIOD // timedelta(hours=1),
                 error,
             )
             downloads.failures.append(_Failure(upload, error, retried=False))
@@ -231,14 +232,25 @@ class _Failure:
 
 @dataclass
 class _Downloads:
-    """The download attempts of one cycle and those of them that failed, but not for good."""
+    """The download attempts of one cycle and those that failed, not for good: retried or given up.
+
+    Tells a broken yt-dlp from videos that fail on their own.
+    """
 
     attempts: int = 0
     failures: list[_Failure] = field(default_factory=list)
 
+    def _yt_dlp_broken(self) -> bool:
+        """Whether every download attempt failed, and in yt-dlp: not writing the Media library."""
+        return (
+            self.attempts > 0
+            and len(self.failures) == self.attempts
+            and all(isinstance(f.error, FetchFailed) for f in self.failures)
+        )
+
     def report_retries(self) -> None:
         """Log each download to be retried, or one message if every download failed."""
-        if self.attempts and len(self.failures) == self.attempts:
+        if self._yt_dlp_broken():
             bot_checks = sum(isinstance(f.error, BotCheck) for f in self.failures)
             log.error(
                 "All downloads failing (%d this cycle, last error: %s); yt-dlp is likely"

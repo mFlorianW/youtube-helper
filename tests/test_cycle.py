@@ -464,7 +464,6 @@ def test_failed_download_leaves_nothing_in_the_media_library_and_is_retried(
 
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
-    assert "All downloads failing (1 this cycle" in caplog.text
     assert list(media_library.rglob("*")) == [media_library / ".youtube-helper-staging"]
     del fetcher.errors["vid00000001"]
     clock.advance()
@@ -786,4 +785,24 @@ def test_permanent_failures_alone_do_not_suggest_yt_dlp_is_outdated(
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
     assert "Downloading Flaky (vid00000002) failed (HTTP Error 503); trying again" in caplog.text
+    assert "outdated" not in caplog.text
+
+
+def test_failing_writes_to_the_media_library_do_not_blame_yt_dlp(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = OSError(28, "No space left on device")
+    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert (
+        "Downloading Doomed (vid00000001) failed ([Errno 28] No space left on device);"
+        " trying again next cycle" in caplog.text
+    )
     assert "outdated" not in caplog.text
