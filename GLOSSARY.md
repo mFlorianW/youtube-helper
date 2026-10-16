@@ -11,7 +11,7 @@ Keeps a Jellyfin media library stocked with new videos from the YouTube channels
 ## Language
 
 **Subscription**:
-A YouTube channel the owner is subscribed to on their own Google account. The account is the source of truth; there is no separately maintained channel list.
+A YouTube channel the owner has subscribed to in the tool itself. The tool's own list of Subscriptions is the source of truth; subscriptions on the owner's YouTube account play no part. Unsubscribing stops tracking but keeps the channel's videos in the Media library.
 _Avoid_: Channel list, followed channel, watchlist
 
 **New upload**:
