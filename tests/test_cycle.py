@@ -115,6 +115,16 @@ def nfo(path: Path) -> tuple[str, dict[str, str]]:
     return root.tag, fields
 
 
+def episode_numbers(media_library: Path) -> dict[str, tuple[str, str]]:
+    """Each filed video's ID with the season and episode number from its NFO."""
+    numbers = {}
+    for path in media_library.rglob("*.nfo"):
+        tag, fields = nfo(path)
+        if tag == "episodedetails":
+            numbers[fields["uniqueid youtube"]] = (fields["season"], fields["episode"])
+    return numbers
+
+
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()
@@ -573,3 +583,101 @@ def test_new_upload_gets_an_episode_nfo_next_to_it(
             "uniqueid youtube": "vid00000001",
         },
     )
+
+
+def test_episodes_are_numbered_per_channel_in_release_order_across_cycles(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST, SECOND)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    feed.publish("UC2", Upload("vid00000002", "Other channel", START + timedelta(minutes=6)))
+    feed.publish("UC1", Upload("vid00000003", "Two", START + timedelta(minutes=7)))
+    feed.publish("UC1", Upload("vid00000004", "Three", START + timedelta(minutes=8)))
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000005", "Four", START + timedelta(minutes=40)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "1"),
+        "vid00000002": ("2026", "1"),
+        "vid00000003": ("2026", "2"),
+        "vid00000004": ("2026", "3"),
+        "vid00000005": ("2026", "4"),
+    }
+
+
+def test_each_new_season_starts_at_episode_one(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    new_year = datetime(2027, 1, 1, tzinfo=UTC)
+    feed.publish("UC1", Upload("vid00000001", "Autumn", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "New Year's Eve", new_year - timedelta(minutes=1)))
+    clock.now = new_year
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000003", "New Year", new_year + timedelta(minutes=1)))
+    feed.publish("UC1", Upload("vid00000004", "January", new_year + timedelta(days=1)))
+    clock.advance(timedelta(days=2))
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "1"),
+        "vid00000002": ("2026", "2"),
+        "vid00000003": ("2027", "1"),
+        "vid00000004": ("2027", "2"),
+    }
+    assert {video.parent.name for video in videos(media_library)} == {
+        "Season 2026",
+        "Season 2027",
+    }
+
+
+def test_video_arriving_late_gets_the_next_number_and_nothing_is_renumbered(
+    media_library: Path, state_dir: Path, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        feed.publish("UC1", Upload("vid00000001", "Early", START + timedelta(minutes=5)))
+        feed.publish("UC1", Upload("vid00000002", "Newer", START + timedelta(minutes=20)))
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    # A premiere released between the two shows up only later; a restart happens in between.
+    feed.publish("UC1", Upload("vid00000003", "Premiere", START + timedelta(minutes=10)))
+    clock.advance()
+
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "1"),
+        "vid00000002": ("2026", "2"),
+        "vid00000003": ("2026", "3"),
+    }
+
+
+def test_video_downloaded_after_a_failure_gets_the_next_number(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Flaky", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=20)))
+    fetcher.errors["vid00000001"] = FetchFailed("HTTP Error 503")
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    del fetcher.errors["vid00000001"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000001": ("2026", "2"),
+        "vid00000002": ("2026", "1"),
+    }
