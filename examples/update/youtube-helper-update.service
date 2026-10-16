@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+#
+# SPDX-License-Identifier: GPL-2.0-only
+
+# Pulls the latest youtube-helper image and recreates the container if the image changed.
+# Started daily by youtube-helper-update.timer; see "Updates" in the README.
+#
+# Install both files into /etc/systemd/system/, then:
+#   systemctl daemon-reload
+#   systemctl enable --now youtube-helper-update.timer
+# Run it once by hand and check the result:
+#   systemctl start youtube-helper-update.service
+#   journalctl -u youtube-helper-update.service
+
+[Unit]
+Description=Update youtube-helper to the latest image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# adjust: the directory holding youtube-helper's compose.yaml.
+WorkingDirectory=/srv/youtube-helper
+# The second command runs only if the first succeeded.
+ExecStart=/usr/bin/docker compose pull --quiet
+ExecStart=/usr/bin/docker compose up -d
