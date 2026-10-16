@@ -5,7 +5,8 @@
 """The Media library: the admin-specified directory the tool files downloaded videos into.
 
 Its layout is fixed:
-`<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>].mkv`.
+`<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>].mkv`,
+with the episode `.nfo` and the `-thumb.jpg` next to each video.
 """
 
 import re
@@ -21,6 +22,8 @@ from youtube_helper.video_fetcher import THUMBNAIL_SUFFIX, VIDEO_SUFFIX
 
 # Hidden, so media servers skip it; inside the Media library, so filing is an atomic rename.
 STAGING_DIR = ".youtube-helper-staging"
+
+NFO_SUFFIX = ".nfo"
 
 # Room for the longest suffix (`-thumb.jpg`) within the usual 255-byte filename limit.
 MAX_BASENAME_BYTES = 240
@@ -81,7 +84,7 @@ def file_video(staged_base: Path, base: Path) -> None:
     Each file appears complete under its final name or not at all.
     """
     base.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in (THUMBNAIL_SUFFIX, VIDEO_SUFFIX):
+    for suffix in (THUMBNAIL_SUFFIX, NFO_SUFFIX, VIDEO_SUFFIX):
         staged_file = staged_base.with_name(staged_base.name + suffix)
         if staged_file.exists():
             staged_file.replace(base.with_name(base.name + suffix))

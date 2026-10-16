@@ -46,6 +46,11 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     " status TEXT NOT NULL)",
     "ALTER TABLE subscription ADD COLUMN channel_folder TEXT NOT NULL DEFAULT ''",
     _name_channel_folders,
+    "CREATE TABLE season ("
+    " channel_id TEXT NOT NULL,"
+    " season INTEGER NOT NULL,"
+    " last_episode INTEGER NOT NULL,"
+    " PRIMARY KEY (channel_id, season))",
 )
 
 
@@ -167,11 +172,28 @@ class StateStore:
             for video_id, title, released in rows
         ]
 
-    def mark_downloaded(self, video_id: str) -> None:
-        """Remember that the video is in the Media library, so it is never fetched again."""
+    def next_episode(self, channel_id: str, season: int) -> int:
+        """The episode number the channel's next video filed into `season` gets."""
+        row = self._connection.execute(
+            "SELECT last_episode FROM season WHERE channel_id = ? AND season = ?",
+            (channel_id, season),
+        ).fetchone()
+        return 1 if row is None else int(row[0]) + 1
+
+    def mark_downloaded(self, video_id: str, channel_id: str, season: int, episode: int) -> None:
+        """Remember that the video is in the Media library as this episode of `season`.
+
+        It is never fetched again, and its episode number is never handed out again.
+        """
         with self._connection:
             self._connection.execute(
                 "UPDATE video SET status = 'downloaded' WHERE video_id = ?", (video_id,)
+            )
+            self._connection.execute(
+                "INSERT INTO season (channel_id, season, last_episode) VALUES (?, ?, ?)"
+                " ON CONFLICT (channel_id, season) DO UPDATE"
+                " SET last_episode = max(last_episode, excluded.last_episode)",
+                (channel_id, season, episode),
             )
 
 

@@ -5,6 +5,7 @@
 import logging
 import os
 import re
+import xml.etree.ElementTree as ET
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,7 +18,7 @@ from youtube_helper.cycle import Cycle
 from youtube_helper.media_library import MediaLibraryUnwritable
 from youtube_helper.state import StateStore
 from youtube_helper.upload_feed import FeedUnavailable, Upload
-from youtube_helper.video_fetcher import FetchFailed
+from youtube_helper.video_fetcher import FetchFailed, VideoMetadata
 
 START = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 UTC_ZONE = ZoneInfo("UTC")
@@ -77,7 +78,7 @@ class FakeFetcher:
         self.library_during_fetch: list[Path] = []
         self.media_library: Path | None = None
 
-    def fetch(self, video_id: str, base: Path) -> None:
+    def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         self.fetched.append(video_id)
         if self.media_library is not None:
             self.library_during_fetch = media_files(self.media_library)
@@ -86,6 +87,7 @@ class FakeFetcher:
             raise self.errors[video_id]
         base.with_name(base.name + ".mkv").write_bytes(f"video {video_id}".encode())
         base.with_name(base.name + "-thumb.jpg").write_bytes(f"thumb {video_id}".encode())
+        return VideoMetadata(description=f"Description of {video_id}")
 
 
 def media_files(media_library: Path) -> list[Path]:
@@ -96,6 +98,21 @@ def media_files(media_library: Path) -> list[Path]:
         if path.is_file()
         and not any(part.startswith(".") for part in path.relative_to(media_library).parts)
     )
+
+
+def videos(media_library: Path) -> list[Path]:
+    """Every video file in the Media library."""
+    return [path for path in media_files(media_library) if path.suffix == ".mkv"]
+
+
+def nfo(path: Path) -> tuple[str, dict[str, str]]:
+    """An NFO file's root element and the text of each child, `uniqueid` with its type."""
+    root = ET.parse(path).getroot()
+    fields = {}
+    for child in root:
+        key = f"uniqueid {child.get('type')}" if child.tag == "uniqueid" else child.tag
+        fields[key] = child.text or ""
+    return root.tag, fields
 
 
 @pytest.fixture
@@ -343,6 +360,7 @@ def test_new_upload_lands_in_its_channel_folder_named_by_release_time_in_local_t
     assert media_files(media_library) == [
         Path("First Channel", "Season 2026", f"{basename}-thumb.jpg"),
         Path("First Channel", "Season 2026", f"{basename}.mkv"),
+        Path("First Channel", "Season 2026", f"{basename}.nfo"),
     ]
     video = media_library / "First Channel" / "Season 2026" / f"{basename}.mkv"
     assert video.read_bytes() == b"video vid00000001"
@@ -423,7 +441,7 @@ def test_overlong_title_is_shortened_to_fit_a_filename(
 
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
-    [_, video] = media_files(media_library)
+    [video] = videos(media_library)
     assert video.name.endswith(" [vid00000001].mkv")
     assert len(video.name.replace(".mkv", "-thumb.jpg").encode()) <= 255
 
@@ -456,7 +474,7 @@ def test_failed_download_leaves_nothing_in_the_media_library_and_is_retried(
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001", "vid00000001"]
-    assert len(media_files(media_library)) == 2
+    assert len(videos(media_library)) == 1
 
 
 def test_video_appears_under_its_final_name_only_once_complete(
@@ -471,7 +489,7 @@ def test_video_appears_under_its_final_name_only_once_complete(
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.library_during_fetch == []
-    assert len(media_files(media_library)) == 2
+    assert len(videos(media_library)) == 1
 
 
 def test_unreadable_feed_is_retried_next_cycle_while_other_channels_go_on(
@@ -521,3 +539,37 @@ def test_upload_left_pending_before_an_unsubscribe_is_not_fetched_after_resubscr
 
     assert fetcher.fetched == ["vid00000001"]
     assert media_files(media_library) == []
+
+
+def test_new_upload_gets_an_episode_nfo_next_to_it(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    released = START + timedelta(hours=11, minutes=30)
+    feed.publish("UC1", Upload("vid00000001", "Tom & Jerry <live>", released))
+    clock.advance(timedelta(hours=12))
+
+    run_cycle(
+        media_library,
+        state,
+        account,
+        clock,
+        feed=feed,
+        fetcher=fetcher,
+        timezone=ZoneInfo("Europe/Berlin"),
+    )
+
+    # 23:30 UTC is already the next day in Berlin.
+    basename = "First Channel - 2026-10-17 01-30 - Tom & Jerry _live_ [vid00000001]"
+    assert nfo(media_library / "First Channel" / "Season 2026" / f"{basename}.nfo") == (
+        "episodedetails",
+        {
+            "title": "Tom & Jerry <live>",
+            "plot": "Description of vid00000001",
+            "aired": "2026-10-17",
+            "season": "2026",
+            "episode": "1",
+            "uniqueid youtube": "vid00000001",
+        },
+    )

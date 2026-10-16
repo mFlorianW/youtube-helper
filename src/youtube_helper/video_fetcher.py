@@ -5,6 +5,7 @@
 """The Video fetcher port: downloads one video, anonymously, with yt-dlp."""
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -23,8 +24,15 @@ class FetchFailed(Exception):
     """The video couldn't be downloaded."""
 
 
+@dataclass(frozen=True)
+class VideoMetadata:
+    """What the episode NFO needs beyond what the Upload feed tells."""
+
+    description: str
+
+
 class VideoFetcher(Protocol):
-    def fetch(self, video_id: str, base: Path) -> None:
+    def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         """Download the video as `<base>.mkv`, its thumbnail as `<base>-thumb.jpg`.
 
         The thumbnail may be missing if YouTube has none. Raises FetchFailed otherwise.
@@ -35,14 +43,15 @@ class VideoFetcher(Protocol):
 class YtDlpFetcher:
     """Downloads with the embedded yt-dlp, anonymously: no cookies, ever."""
 
-    def fetch(self, video_id: str, base: Path) -> None:
+    def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         try:
             with yt_dlp.YoutubeDL(_options(base)) as ydl:
-                ydl.download([WATCH_URL + video_id])
+                info = ydl.extract_info(WATCH_URL + video_id, download=True)
         except YoutubeDLError as error:
             raise FetchFailed(str(error)) from error
         if not base.with_name(base.name + VIDEO_SUFFIX).is_file():
             raise FetchFailed(f"yt-dlp produced no {VIDEO_SUFFIX} file")
+        return VideoMetadata(description=str(info.get("description") or ""))
 
 
 def _options(base: Path) -> dict[str, Any]:

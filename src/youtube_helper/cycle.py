@@ -19,12 +19,14 @@ from youtube_helper.account import (
     Subscription,
 )
 from youtube_helper.media_library import (
+    NFO_SUFFIX,
     channel_folder,
     ensure_writable,
     file_video,
     staged,
     video_base,
 )
+from youtube_helper.nfo import episode_nfo
 from youtube_helper.state import StateStore, TrackedSubscription
 from youtube_helper.upload_feed import FeedUnavailable, UploadFeed
 from youtube_helper.video_fetcher import FetchFailed, VideoFetcher
@@ -88,10 +90,23 @@ class Cycle:
             base = video_base(
                 self._media_library, subscription.channel_folder, upload, self._timezone
             )
+            aired = upload.released.astimezone(self._timezone).date()
+            # Numbered when filed, so a video arriving late gets the next number of its season.
+            episode = self._state.next_episode(subscription.channel_id, aired.year)
             log.info("Downloading %s (%s)", upload.title, upload.video_id)
             try:
                 with staged(self._media_library, upload.video_id) as staged_base:
-                    self._fetcher.fetch(upload.video_id, staged_base)
+                    metadata = self._fetcher.fetch(upload.video_id, staged_base)
+                    staged_base.with_name(staged_base.name + NFO_SUFFIX).write_bytes(
+                        episode_nfo(
+                            title=upload.title,
+                            plot=metadata.description,
+                            aired=aired,
+                            season=aired.year,
+                            episode=episode,
+                            video_id=upload.video_id,
+                        )
+                    )
                     file_video(staged_base, base)
             except (FetchFailed, OSError) as error:
                 log.warning(
@@ -101,7 +116,9 @@ class Cycle:
                     error,
                 )
                 continue
-            self._state.mark_downloaded(upload.video_id)
+            self._state.mark_downloaded(
+                upload.video_id, subscription.channel_id, aired.year, episode
+            )
             log.info("Downloaded %s", base.relative_to(self._media_library))
 
     def _active_subscriptions(self) -> list[TrackedSubscription]:
