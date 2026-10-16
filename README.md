@@ -40,8 +40,8 @@ All configuration is passed to the container by Compose. There is no config file
 | `MEDIA_LIBRARY`                | environment          | required | Path of the Media library inside the container. Mount the host directory there read-write.                        |
 | `STATE_DIR`                    | environment          | `/state` | Directory holding the SQLite state database `youtube-helper.sqlite3`. Mount a host directory there and back it up. |
 | `TZ`                           | environment          | `UTC`    | IANA time zone, e.g. `Europe/Berlin`. Used for log times and release times. An unknown name stops the daemon.     |
-| `google_client_id`             | secret               | none     | File containing the Google OAuth client ID. Mounted at `/run/secrets/google_client_id`.                            |
-| `google_client_secret`         | secret               | none     | File containing the Google OAuth client secret. Mounted at `/run/secrets/google_client_secret`.                    |
+| `google_client_id`             | secret               | none     | The Google OAuth client ID, mounted as a file at `/run/secrets/google_client_id`.                            |
+| `google_client_secret`         | secret               | none     | The Google OAuth client secret, mounted as a file at `/run/secrets/google_client_secret`.                    |
 | `user`                         | Compose service key  | root     | UID:GID the tool runs as. It must be able to write the Media library and state directory and read the secrets.    |
 
 The daemon checks that the Media library is writable at startup and before every cycle. If it
