@@ -25,6 +25,7 @@ STAGING_DIR = ".youtube-helper-staging"
 
 NFO_SUFFIX = ".nfo"
 TVSHOW_NFO = "tvshow.nfo"
+POSTER = "poster.jpg"
 
 # Room for the longest suffix (`-thumb.jpg`) within the usual 255-byte filename limit.
 MAX_BASENAME_BYTES = 240

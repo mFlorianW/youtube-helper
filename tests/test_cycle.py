@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from youtube_helper.account import AccountUnavailable, LoginLapsed, LoginMissing, Subscription
+from youtube_helper.artwork import ArtworkUnavailable
 from youtube_helper.cycle import Cycle
 from youtube_helper.media_library import MediaLibraryUnwritable
 from youtube_helper.state import StateStore
@@ -90,6 +91,18 @@ class FakeFetcher:
         return VideoMetadata(description=f"Description of {video_id}")
 
 
+class FakeArtwork:
+    """Answers each image URL with made-up image data, or raises the error set for it."""
+
+    def __init__(self) -> None:
+        self.errors: dict[str, Exception] = {}
+
+    def download(self, url: str) -> bytes:
+        if url in self.errors:
+            raise self.errors[url]
+        return f"image {url}".encode()
+
+
 def media_files(media_library: Path) -> list[Path]:
     """Every file a media server would see: hidden directories are ignored."""
     return sorted(
@@ -140,6 +153,11 @@ def fetcher() -> FakeFetcher:
     return FakeFetcher()
 
 
+@pytest.fixture
+def artwork() -> FakeArtwork:
+    return FakeArtwork()
+
+
 @pytest.fixture(autouse=True)
 def info_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO)
@@ -153,6 +171,7 @@ def run_cycle(
     *,
     feed: FakeFeed | None = None,
     fetcher: FakeFetcher | None = None,
+    artwork: FakeArtwork | None = None,
     timezone: ZoneInfo = UTC_ZONE,
 ) -> None:
     Cycle(
@@ -161,6 +180,7 @@ def run_cycle(
         account=account,
         feed=feed or FakeFeed(),
         fetcher=fetcher or FakeFetcher(),
+        artwork=artwork or FakeArtwork(),
         timezone=timezone,
         clock=clock or FakeClock(),
     ).run()
@@ -371,6 +391,7 @@ def test_new_upload_lands_in_its_channel_folder_named_by_release_time_in_local_t
         Path("First Channel", "Season 2026", f"{basename}-thumb.jpg"),
         Path("First Channel", "Season 2026", f"{basename}.mkv"),
         Path("First Channel", "Season 2026", f"{basename}.nfo"),
+        Path("First Channel", "poster.jpg"),
         Path("First Channel", "tvshow.nfo"),
     ]
     video = media_library / "First Channel" / "Season 2026" / f"{basename}.mkv"
@@ -720,3 +741,65 @@ def test_tvshow_nfo_is_written_from_the_last_known_subscription_while_the_login_
         "tvshow",
         {"title": "First Channel", "plot": "New description", "uniqueid youtube": "UC1"},
     )
+
+
+def test_channel_folder_gets_the_channel_avatar_as_poster(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    poster = media_library / "First Channel" / "poster.jpg"
+    assert poster.read_bytes() == b"image https://yt3.ggpht.com/UC1"
+
+
+def test_poster_that_cannot_be_downloaded_is_tried_again_next_cycle(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    artwork: FakeArtwork,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    artwork.errors[FIRST.avatar_url or ""] = ArtworkUnavailable("HTTP 503")
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+
+    assert "Can't download the poster of First Channel (HTTP 503)" in caplog.text
+    assert Path("First Channel", "poster.jpg") not in media_files(media_library)
+    assert Path("First Channel", "tvshow.nfo") in media_files(media_library)
+    artwork.errors.clear()
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+
+    assert Path("First Channel", "poster.jpg") in media_files(media_library)
+
+
+def test_channel_without_avatar_gets_no_poster(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(THIRD)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC3", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert Path("Third Channel", "tvshow.nfo") in media_files(media_library)
+    assert Path("Third Channel", "poster.jpg") not in media_files(media_library)
+    assert "poster" not in caplog.text

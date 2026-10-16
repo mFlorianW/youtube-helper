@@ -13,6 +13,7 @@ from datetime import timedelta
 import httpx
 
 from youtube_helper.account import GoogleAccount
+from youtube_helper.artwork import HttpArtwork
 from youtube_helper.config import ConfigError, load_config
 from youtube_helper.cycle import Cycle
 from youtube_helper.google import HTTP_TIMEOUT
@@ -47,6 +48,7 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
                 account=GoogleAccount(state, http),
                 feed=YouTubeFeed(http),
                 fetcher=YtDlpFetcher(),
+                artwork=HttpArtwork(http),
                 timezone=config.timezone,
             )
             while True:

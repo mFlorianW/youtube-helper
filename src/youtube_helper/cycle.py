@@ -18,8 +18,10 @@ from youtube_helper.account import (
     LoginMissing,
     Subscription,
 )
+from youtube_helper.artwork import Artwork, ArtworkUnavailable
 from youtube_helper.media_library import (
     NFO_SUFFIX,
+    POSTER,
     TVSHOW_NFO,
     channel_folder,
     ensure_writable,
@@ -45,6 +47,7 @@ class Cycle:
         account: Account,
         feed: UploadFeed,
         fetcher: VideoFetcher,
+        artwork: Artwork,
         timezone: ZoneInfo,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -53,6 +56,7 @@ class Cycle:
         self._account = account
         self._feed = feed
         self._fetcher = fetcher
+        self._artwork = artwork
         self._timezone = timezone
         self._clock = clock
 
@@ -125,21 +129,40 @@ class Cycle:
             log.info("Downloaded %s", base.relative_to(self._media_library))
 
     def _complete_channel_folder(self, subscription: TrackedSubscription) -> None:
-        """Give a Channel folder holding videos the series metadata it still lacks."""
+        """Give a Channel folder holding videos the `tvshow.nfo` and poster it still lacks.
+
+        Each is written once; one that can't be written is tried again next cycle.
+        """
         folder = self._media_library / subscription.channel_folder
         if not folder.is_dir():
             return
         tvshow = folder / TVSHOW_NFO
         if not tvshow.exists():
-            file_atomically(
-                self._media_library,
-                tvshow,
-                tvshow_nfo(
-                    title=subscription.display_name,
-                    plot=subscription.description,
-                    channel_id=subscription.channel_id,
-                ),
+            content = tvshow_nfo(
+                title=subscription.display_name,
+                plot=subscription.description,
+                channel_id=subscription.channel_id,
             )
+            try:
+                file_atomically(self._media_library, tvshow, content)
+            except OSError as error:
+                log.warning(
+                    "Can't write the %s of %s (%s); trying again next cycle",
+                    TVSHOW_NFO,
+                    subscription.display_name,
+                    error,
+                )
+        poster = folder / POSTER
+        if subscription.avatar_url is not None and not poster.exists():
+            try:
+                image = self._artwork.download(subscription.avatar_url)
+                file_atomically(self._media_library, poster, image)
+            except (ArtworkUnavailable, OSError) as error:
+                log.warning(
+                    "Can't download the poster of %s (%s); trying again next cycle",
+                    subscription.display_name,
+                    error,
+                )
 
     def _active_subscriptions(self) -> list[TrackedSubscription]:
         """The Subscriptions to follow this cycle, synced with the account when it can be read."""
