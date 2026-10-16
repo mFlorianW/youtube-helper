@@ -18,6 +18,8 @@ from youtube_helper.cycle import Cycle
 from youtube_helper.google import HTTP_TIMEOUT
 from youtube_helper.media_library import MediaLibraryUnwritable, ensure_writable
 from youtube_helper.state import StateStore, StateUnavailable
+from youtube_helper.upload_feed import YouTubeFeed
+from youtube_helper.video_fetcher import YtDlpFetcher
 
 CYCLE_INTERVAL = timedelta(minutes=30)
 
@@ -39,7 +41,14 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
             closing(StateStore.open(config.state_dir)) as state,
             httpx.Client(timeout=HTTP_TIMEOUT) as http,
         ):
-            cycle = Cycle(config.media_library, state, GoogleAccount(state, http))
+            cycle = Cycle(
+                config.media_library,
+                state,
+                account=GoogleAccount(state, http),
+                feed=YouTubeFeed(http),
+                fetcher=YtDlpFetcher(),
+                timezone=config.timezone,
+            )
             while True:
                 cycle.run()
                 sleep(CYCLE_INTERVAL.total_seconds())

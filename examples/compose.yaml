@@ -28,8 +28,8 @@ services:
       # Where the Media library is mounted inside the container (must match `volumes:`).
       # Required: the daemon refuses to start without it.
       MEDIA_LIBRARY: /media-library
-      # adjust: your local time zone (IANA name). Used for log times and, later, for the
-      # release time in filenames. Defaults to UTC; an unknown name stops the daemon.
+      # adjust: your local time zone (IANA name). Used for log times and for the release
+      # time in filenames. Defaults to UTC; an unknown name stops the daemon.
       TZ: Europe/Berlin
       # Where the SQLite state lives inside the container. /state is the default, so this
       # line is optional; it is shown only to explain the `/state` mount below.
