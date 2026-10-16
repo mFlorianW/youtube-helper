@@ -174,6 +174,13 @@ class StateStore:
                 "UPDATE video SET status = 'downloaded' WHERE video_id = ?", (video_id,)
             )
 
+    def mark_excluded(self, video_id: str) -> None:
+        """Remember that the video is not a regular one, so it is never fetched again."""
+        with self._connection:
+            self._connection.execute(
+                "UPDATE video SET status = 'excluded' WHERE video_id = ?", (video_id,)
+            )
+
 
 def _migrate(connection: sqlite3.Connection) -> None:
     (version,) = connection.execute("PRAGMA user_version").fetchone()

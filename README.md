@@ -149,6 +149,9 @@ yt-dlp (never with your Google cookies) and filed into the Media library:
   merged into MKV with metadata and chapters embedded.
 - Downloads go to the hidden `.youtube-helper-staging` directory in the Media library first and
   are moved into place only when complete, so a media server never sees a half-finished file.
+- Only regular videos are downloaded. Shorts, running live streams and livestream recordings
+  are logged once as `Excluded` and never looked at again. A premiere is left alone while it is
+  upcoming or still airing and downloaded once it has aired, like any regular video.
 - Each video is downloaded once, also across restarts. A failed download is tried again the
   next cycle.
 - Before each download the daemon checks the free space in the Media library. Below 10 GiB it
