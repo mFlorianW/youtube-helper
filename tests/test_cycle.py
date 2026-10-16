@@ -17,7 +17,13 @@ from youtube_helper.cycle import Cycle
 from youtube_helper.media_library import MediaLibraryUnwritable
 from youtube_helper.state import StateStore
 from youtube_helper.upload_feed import FeedUnavailable, Upload
-from youtube_helper.video_fetcher import FetchFailed, NotAiredYet, NotRegularVideo
+from youtube_helper.video_fetcher import (
+    BotCheck,
+    FetchFailed,
+    NotAiredYet,
+    NotRegularVideo,
+    VideoUnavailable,
+)
 
 START = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 GIB = 1024**3
@@ -464,7 +470,6 @@ def test_failed_download_leaves_nothing_in_the_media_library_and_is_retried(
 
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
-    assert "Downloading Flaky (vid00000001) failed" in caplog.text
     assert list(media_library.rglob("*")) == [media_library / ".youtube-helper-staging"]
     del fetcher.errors["vid00000001"]
     clock.advance()
@@ -605,6 +610,210 @@ def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle
     assert sorted(fetcher.fetched) == ["vid00000001", "vid00000002", "vid00000003"]
 
 
+def new_upload_failing_with(
+    error: Exception,
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+) -> FakeAccount:
+    """Start tracking First Channel, then publish a New upload whose download raises `error`."""
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Doomed", START + timedelta(minutes=5)))
+    fetcher.errors["vid00000001"] = error
+    clock.advance()
+    return account
+
+
+def test_permanently_unavailable_video_is_skipped_logged_once_and_never_retried(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = VideoUnavailable("Private video. Sign in if you've been granted access")
+    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+
+    for _ in range(3):
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        clock.advance()
+
+    assert fetcher.fetched == ["vid00000001"]
+    assert (
+        caplog.text.count(
+            "Skipped Doomed (vid00000001) for good: Private video. Sign in if you've been"
+            " granted access"
+        )
+        == 1
+    )
+    assert "trying again" not in caplog.text
+    assert "outdated" not in caplog.text
+    assert media_files(media_library) == []
+
+
+def test_transiently_failing_video_is_retried_every_cycle_then_given_up_after_24_hours(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = FetchFailed("HTTP Error 503: Service Unavailable")
+    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    first_failure = clock.now
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    clock.now = first_failure + timedelta(hours=23, minutes=59)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001", "vid00000001"]
+    assert "Gave up" not in caplog.text
+    clock.now = first_failure + timedelta(hours=24)
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001"] * 3
+    assert (
+        caplog.text.count(
+            "Gave up on Doomed (vid00000001) after failing for 24 hours:"
+            " HTTP Error 503: Service Unavailable"
+        )
+        == 1
+    )
+
+
+def test_bot_check_is_called_out_and_retried(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = BotCheck("Sign in to confirm you're not a bot")
+    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=6)))
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert (
+        "YouTube asked for a bot check while downloading Doomed (vid00000001); trying again"
+        " next cycle. If this keeps happening, a PO-token provider is needed" in caplog.text
+    )
+    del fetcher.errors["vid00000001"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001", "vid00000002", "vid00000001"]
+    assert len(media_files(media_library)) == 4
+
+
+def test_cycle_where_every_download_fails_says_once_that_yt_dlp_is_likely_outdated(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(FIRST, SECOND)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Two", START + timedelta(minutes=6)))
+    feed.publish("UC2", Upload("vid00000003", "Three", START + timedelta(minutes=7)))
+    fetcher.errors["vid00000001"] = FetchFailed("Unable to extract player response")
+    fetcher.errors["vid00000002"] = FetchFailed("Unable to extract player response")
+    fetcher.errors["vid00000003"] = BotCheck("Sign in to confirm you're not a bot")
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001", "vid00000002", "vid00000003"]
+    assert (
+        caplog.text.count(
+            "All downloads failing (3 this cycle, last error: Sign in to confirm you're not a"
+            " bot); yt-dlp is likely outdated, pull the latest image. YouTube asked 1 of them"
+            " for a bot check. If this keeps happening, a PO-token provider is needed"
+        )
+        == 1
+    )
+    assert "trying again" not in caplog.text
+    fetcher.errors.clear()
+    caplog.clear()
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert len(media_files(media_library)) == 6
+    assert "outdated" not in caplog.text
+
+
+def test_cycle_with_some_downloads_succeeding_reports_each_failure(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = FetchFailed("HTTP Error 503")
+    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=6)))
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert "Downloading Doomed (vid00000001) failed (HTTP Error 503); trying again" in caplog.text
+    assert "outdated" not in caplog.text
+
+
+def test_permanent_failures_alone_do_not_suggest_yt_dlp_is_outdated(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = new_upload_failing_with(
+        VideoUnavailable("Video unavailable"), media_library, state, clock, feed, fetcher
+    )
+    feed.publish("UC1", Upload("vid00000002", "Flaky", START + timedelta(minutes=6)))
+    fetcher.errors["vid00000002"] = FetchFailed("HTTP Error 503")
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert "Downloading Flaky (vid00000002) failed (HTTP Error 503); trying again" in caplog.text
+    assert "outdated" not in caplog.text
+
+
+def test_failing_writes_to_the_media_library_do_not_blame_yt_dlp(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = OSError(28, "No space left on device")
+    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert (
+        "Downloading Doomed (vid00000001) failed ([Errno 28] No space left on device);"
+        " trying again next cycle" in caplog.text
+    )
+    assert "outdated" not in caplog.text
+
+
 @pytest.mark.parametrize(
     "kind",
     ["a Short", "a scheduled live stream", "a running live stream", "a livestream recording"],
@@ -667,3 +876,45 @@ def test_premiere_is_skipped_while_upcoming_and_downloaded_once_aired(
     assert fetcher.fetched == ["vid00000001"] * 3
     basename = "First Channel - 2026-10-16 12-05 - Premiere [vid00000001]"
     assert Path("First Channel", "Season 2026", f"{basename}.mkv") in media_files(media_library)
+
+
+def test_videos_not_to_be_downloaded_neither_hide_nor_count_as_failing_downloads(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Premiere", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Short", START + timedelta(minutes=6)))
+    feed.publish("UC1", Upload("vid00000003", "Broken", START + timedelta(minutes=7)))
+    fetcher.errors["vid00000001"] = NotAiredYet("upcoming")
+    fetcher.errors["vid00000002"] = NotRegularVideo("a Short")
+    fetcher.errors["vid00000003"] = FetchFailed("Unable to extract player response")
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert "All downloads failing (1 this cycle" in caplog.text
+    # A premiere upcoming for days is never given up on.
+    del fetcher.errors["vid00000003"]
+    clock.advance(timedelta(days=2))
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    del fetcher.errors["vid00000001"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert "Gave up" not in caplog.text
+    assert sorted(fetcher.fetched) == [
+        "vid00000001",
+        "vid00000001",
+        "vid00000001",
+        "vid00000002",
+        "vid00000003",
+        "vid00000003",
+    ]
+    assert len(media_files(media_library)) == 4
