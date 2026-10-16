@@ -9,7 +9,8 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
-from youtube_helper.login import DEVICE_CODE_URL, SCOPE, TOKEN_URL, run_login
+from youtube_helper.google import TOKEN_URL
+from youtube_helper.login import DEVICE_CODE_URL, SCOPE, run_login
 from youtube_helper.state import StateStore
 
 type Reply = tuple[int, dict[str, object]]
@@ -71,15 +72,6 @@ class FakeTime:
 
     def clock(self) -> float:
         return self.now
-
-
-@pytest.fixture
-def secrets_dir(tmp_path: Path) -> Path:
-    directory = tmp_path / "secrets"
-    directory.mkdir()
-    (directory / "google_client_id").write_text("client-id.apps.googleusercontent.com\n")
-    (directory / "google_client_secret").write_text("client-secret\n")
-    return directory
 
 
 def login(google: FakeGoogle, state_dir: Path, secrets_dir: Path, time: FakeTime) -> int:

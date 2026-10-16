@@ -10,8 +10,12 @@ from collections.abc import Callable, Mapping
 from contextlib import closing
 from datetime import timedelta
 
+import httpx
+
+from youtube_helper.account import GoogleAccount
 from youtube_helper.config import ConfigError, load_config
 from youtube_helper.cycle import Cycle
+from youtube_helper.google import HTTP_TIMEOUT
 from youtube_helper.media_library import MediaLibraryUnwritable, ensure_writable
 from youtube_helper.state import StateStore, StateUnavailable
 
@@ -31,8 +35,11 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
             config.state_dir,
             config.timezone,
         )
-        with closing(StateStore.open(config.state_dir)) as state:
-            cycle = Cycle(config.media_library, state)
+        with (
+            closing(StateStore.open(config.state_dir)) as state,
+            httpx.Client(timeout=HTTP_TIMEOUT) as http,
+        ):
+            cycle = Cycle(config.media_library, state, GoogleAccount(state, http))
             while True:
                 cycle.run()
                 sleep(CYCLE_INTERVAL.total_seconds())
