@@ -33,7 +33,8 @@ from youtube_helper.video_fetcher import FetchFailed, VideoFetcher
 log = logging.getLogger(__name__)
 
 # Below this much free space in the Media library, downloads wait so the disk never fills up.
-MIN_FREE_SPACE = 10 * 1024**3
+GIB = 1024**3
+MIN_FREE_SPACE = 10 * GIB
 
 
 class Cycle:
@@ -72,13 +73,13 @@ class Cycle:
         log.info("Cycle finished")
 
     def _enough_free_space(self) -> bool:
-        """Whether the disk guard lets the next download start; logs why not when it doesn't."""
+        """Whether there is room for the next download; logs why not when there isn't."""
         free = self._free_space(self._media_library)
         if free >= MIN_FREE_SPACE:
             return True
         log.warning(
             "Only %s free in the Media library %s, less than %s; "
-            "skipping downloads this cycle, New uploads stay pending",
+            "no more downloads this cycle, New uploads stay pending",
             _format_size(free),
             self._media_library,
             _format_size(MIN_FREE_SPACE),
@@ -200,4 +201,4 @@ def _format_time(moment: datetime) -> str:
 
 
 def _format_size(size: int) -> str:
-    return f"{size / 1024**3:.1f} GiB"
+    return f"{size / GIB:.1f} GiB"

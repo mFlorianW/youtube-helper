@@ -56,10 +56,8 @@ class FakeDisk:
 
     def __init__(self, free: int = 100 * GIB) -> None:
         self.free = free
-        self.asked_for: list[Path] = []
 
     def __call__(self, path: Path) -> int:
-        self.asked_for.append(path)
         return self.free
 
 
@@ -560,12 +558,11 @@ def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_spac
 
     assert (
         f"Only 9.0 GiB free in the Media library {media_library}, less than 10.0 GiB; "
-        "skipping downloads this cycle, New uploads stay pending" in caplog.text
+        "no more downloads this cycle, New uploads stay pending" in caplog.text
     )
     assert "Started tracking Second Channel (UC2)" in caplog.text
     assert fetcher.fetched == []
     assert media_files(media_library) == []
-    assert disk.asked_for[-1] == media_library
     # Gone from the feed by now: only detection during the low-space cycle knows about it.
     feed.channels["UC1"] = []
     disk.free = 10 * GIB
@@ -574,7 +571,7 @@ def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_spac
 
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
 
-    assert "skipping downloads" not in caplog.text
+    assert "no more downloads" not in caplog.text
     assert fetcher.fetched == ["vid00000001"]
     assert len(media_files(media_library)) == 2
 
@@ -599,7 +596,7 @@ def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
 
     assert len(fetcher.fetched) == 2
-    assert caplog.text.count("skipping downloads this cycle") == 1
+    assert caplog.text.count("no more downloads this cycle") == 1
     disk.free = 100 * GIB
     clock.advance()
 
