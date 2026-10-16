@@ -53,6 +53,11 @@ def ensure_writable(path: Path) -> None:
         raise MediaLibraryUnwritable(path, error) from error
 
 
+def free_space(path: Path) -> int:
+    """Bytes free on the filesystem holding `path`, as far as the tool may use them."""
+    return shutil.disk_usage(path).free
+
+
 def channel_folder(display_name: str, channel_id: str) -> str:
     """The Channel folder's name for a channel display name (the one from first sight)."""
     return _sanitise(display_name, MAX_CHANNEL_BYTES) or channel_id

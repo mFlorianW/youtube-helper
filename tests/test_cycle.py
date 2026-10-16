@@ -23,6 +23,7 @@ from youtube_helper.upload_feed import FeedUnavailable, Upload
 from youtube_helper.video_fetcher import FetchFailed, VideoMetadata
 
 START = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+GIB = 1024**3
 UTC_ZONE = ZoneInfo("UTC")
 
 FIRST = Subscription("UC1", "First Channel", "https://yt3.ggpht.com/UC1", "About First")
@@ -53,6 +54,16 @@ class FakeClock:
         self.now += delta
 
 
+class FakeDisk:
+    """Reports the free space set on it for the Media library."""
+
+    def __init__(self, free: int = 100 * GIB) -> None:
+        self.free = free
+
+    def __call__(self, path: Path) -> int:
+        return self.free
+
+
 class FakeFeed:
     """Answers with the uploads set per channel, or raises the error set for it."""
 
@@ -79,9 +90,12 @@ class FakeFetcher:
         self.errors: dict[str, Exception] = {}
         self.library_during_fetch: list[Path] = []
         self.media_library: Path | None = None
+        self.disk: FakeDisk | None = None
 
     def fetch(self, video_id: str, base: Path) -> VideoMetadata:
         self.fetched.append(video_id)
+        if self.disk is not None:
+            self.disk.free -= GIB
         if self.media_library is not None:
             self.library_during_fetch = media_files(self.media_library)
         if video_id in self.errors:
@@ -173,6 +187,7 @@ def run_cycle(
     feed: FakeFeed | None = None,
     fetcher: FakeFetcher | None = None,
     artwork: FakeArtwork | None = None,
+    disk: FakeDisk | None = None,
     timezone: ZoneInfo = UTC_ZONE,
 ) -> None:
     Cycle(
@@ -184,6 +199,7 @@ def run_cycle(
         artwork=artwork or FakeArtwork(),
         timezone=timezone,
         clock=clock or FakeClock(),
+        free_space=disk or FakeDisk(),
     ).run()
 
 
@@ -820,3 +836,69 @@ def test_tvshow_nfo_follows_a_changed_channel_description(
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
 
     assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["plot"] == "About First, revised"
+
+
+def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_space_returns(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    disk = FakeDisk(free=9 * GIB)
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    feed.publish("UC1", Upload("vid00000001", "Waiting", START + timedelta(minutes=5)))
+    account.current = [FIRST, SECOND]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+
+    assert (
+        f"Only 9.0 GiB free in the Media library {media_library}, less than 10.0 GiB; "
+        "no more downloads this cycle, New uploads stay pending" in caplog.text
+    )
+    assert "Started tracking Second Channel (UC2)" in caplog.text
+    assert fetcher.fetched == []
+    assert media_files(media_library) == []
+    # Gone from the feed by now: only detection during the low-space cycle knows about it.
+    feed.channels["UC1"] = []
+    disk.free = 10 * GIB
+    caplog.clear()
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+
+    assert "no more downloads" not in caplog.text
+    assert fetcher.fetched == ["vid00000001"]
+    assert len(videos(media_library)) == 1
+
+
+def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    disk = FakeDisk(free=11 * GIB)
+    fetcher.disk = disk
+    account = FakeAccount(FIRST, SECOND)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    feed.publish("UC1", Upload("vid00000001", "Fits", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Also fits", START + timedelta(minutes=6)))
+    feed.publish("UC2", Upload("vid00000003", "Waits", START + timedelta(minutes=7)))
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+
+    assert len(fetcher.fetched) == 2
+    assert caplog.text.count("no more downloads this cycle") == 1
+    disk.free = 100 * GIB
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+
+    assert sorted(fetcher.fetched) == ["vid00000001", "vid00000002", "vid00000003"]

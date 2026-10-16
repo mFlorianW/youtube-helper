@@ -27,15 +27,20 @@ from youtube_helper.media_library import (
     ensure_writable,
     file_atomically,
     file_video,
+    free_space,
     staged,
     video_base,
 )
 from youtube_helper.nfo import episode_nfo, tvshow_nfo
 from youtube_helper.state import StateStore, TrackedSubscription
-from youtube_helper.upload_feed import FeedUnavailable, UploadFeed
+from youtube_helper.upload_feed import FeedUnavailable, Upload, UploadFeed
 from youtube_helper.video_fetcher import FetchFailed, VideoFetcher
 
 log = logging.getLogger(__name__)
+
+# Below this much free space in the Media library, downloads wait so the disk never fills up.
+GIB = 1024**3
+MIN_FREE_SPACE = 10 * GIB
 
 
 class Cycle:
@@ -50,6 +55,7 @@ class Cycle:
         artwork: Artwork,
         timezone: ZoneInfo,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        free_space: Callable[[Path], int] = free_space,
     ) -> None:
         self._media_library = media_library
         self._state = state
@@ -59,6 +65,7 @@ class Cycle:
         self._artwork = artwork
         self._timezone = timezone
         self._clock = clock
+        self._free_space = free_space
 
     def run(self) -> None:
         """Run one cycle.
@@ -67,11 +74,27 @@ class Cycle:
         """
         ensure_writable(self._media_library)
         log.info("Cycle started")
-        for subscription in self._active_subscriptions():
+        subscriptions = self._active_subscriptions()
+        for subscription in subscriptions:
             self._detect_new_uploads(subscription)
-            self._download_new_uploads(subscription)
+        self._download_new_uploads(subscriptions)
+        for subscription in subscriptions:
             self._complete_channel_folder(subscription)
         log.info("Cycle finished")
+
+    def _enough_free_space(self) -> bool:
+        """Whether there is room for the next download; logs why not when there isn't."""
+        free = self._free_space(self._media_library)
+        if free >= MIN_FREE_SPACE:
+            return True
+        log.warning(
+            "Only %s free in the Media library %s, less than %s; "
+            "no more downloads this cycle, New uploads stay pending",
+            _format_size(free),
+            self._media_library,
+            _format_size(MIN_FREE_SPACE),
+        )
+        return False
 
     def _detect_new_uploads(self, subscription: TrackedSubscription) -> None:
         """Remember the uploads released after the Subscription's tracking start."""
@@ -89,43 +112,46 @@ class Cycle:
             (u for u in uploads if subscription.tracks(u)),
         )
 
-    def _download_new_uploads(self, subscription: TrackedSubscription) -> None:
-        for upload in self._state.pending_uploads(subscription.channel_id):
-            # Uploads left pending before an unsubscribe fall into the gap: never fetched.
-            if not subscription.tracks(upload):
-                continue
-            base = video_base(
-                self._media_library, subscription.channel_folder, upload, self._timezone
-            )
-            aired = upload.released.astimezone(self._timezone).date()
-            # Numbered when filed, so a video arriving late gets the next number of its season.
-            episode = self._state.next_episode(subscription.channel_id, aired.year)
-            log.info("Downloading %s (%s)", upload.title, upload.video_id)
-            try:
-                with staged(self._media_library, upload.video_id) as staged_base:
-                    metadata = self._fetcher.fetch(upload.video_id, staged_base)
-                    staged_base.with_name(staged_base.name + NFO_SUFFIX).write_bytes(
-                        episode_nfo(
-                            title=upload.title,
-                            plot=metadata.description,
-                            aired=aired,
-                            episode=episode,
-                            video_id=upload.video_id,
-                        )
+    def _download_new_uploads(self, subscriptions: list[TrackedSubscription]) -> None:
+        for subscription in subscriptions:
+            for upload in self._state.pending_uploads(subscription.channel_id):
+                # Uploads left pending before an unsubscribe fall into the gap: never fetched.
+                if not subscription.tracks(upload):
+                    continue
+                # Checked before every download, as each one eats into the free space.
+                if not self._enough_free_space():
+                    return
+                self._download(subscription, upload)
+
+    def _download(self, subscription: TrackedSubscription, upload: Upload) -> None:
+        base = video_base(self._media_library, subscription.channel_folder, upload, self._timezone)
+        aired = upload.released.astimezone(self._timezone).date()
+        # Numbered when filed, so a video arriving late gets the next number of its season.
+        episode = self._state.next_episode(subscription.channel_id, aired.year)
+        log.info("Downloading %s (%s)", upload.title, upload.video_id)
+        try:
+            with staged(self._media_library, upload.video_id) as staged_base:
+                metadata = self._fetcher.fetch(upload.video_id, staged_base)
+                staged_base.with_name(staged_base.name + NFO_SUFFIX).write_bytes(
+                    episode_nfo(
+                        title=upload.title,
+                        plot=metadata.description,
+                        aired=aired,
+                        episode=episode,
+                        video_id=upload.video_id,
                     )
-                    file_video(staged_base, base)
-            except (FetchFailed, OSError) as error:
-                log.warning(
-                    "Downloading %s (%s) failed (%s); trying again next cycle",
-                    upload.title,
-                    upload.video_id,
-                    error,
                 )
-                continue
-            self._state.mark_downloaded(
-                upload.video_id, subscription.channel_id, aired.year, episode
+                file_video(staged_base, base)
+        except (FetchFailed, OSError) as error:
+            log.warning(
+                "Downloading %s (%s) failed (%s); trying again next cycle",
+                upload.title,
+                upload.video_id,
+                error,
             )
-            log.info("Downloaded %s", base.relative_to(self._media_library))
+            return
+        self._state.mark_downloaded(upload.video_id, subscription.channel_id, aired.year, episode)
+        log.info("Downloaded %s", base.relative_to(self._media_library))
 
     def _complete_channel_folder(self, subscription: TrackedSubscription) -> None:
         """Keep a Channel folder holding videos furnished with its `tvshow.nfo` and poster.
@@ -240,3 +266,7 @@ class Cycle:
 
 def _format_time(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _format_size(size: int) -> str:
+    return f"{size / GIB:.1f} GiB"
