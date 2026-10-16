@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from youtube_helper.account import (
     Account,
@@ -17,8 +18,16 @@ from youtube_helper.account import (
     LoginMissing,
     Subscription,
 )
-from youtube_helper.media_library import ensure_writable
+from youtube_helper.media_library import (
+    channel_folder,
+    ensure_writable,
+    file_video,
+    staged,
+    video_base,
+)
 from youtube_helper.state import StateStore, TrackedSubscription
+from youtube_helper.upload_feed import FeedUnavailable, UploadFeed
+from youtube_helper.video_fetcher import FetchFailed, VideoFetcher
 
 log = logging.getLogger(__name__)
 
@@ -28,12 +37,19 @@ class Cycle:
         self,
         media_library: Path,
         state: StateStore,
+        *,
         account: Account,
+        feed: UploadFeed,
+        fetcher: VideoFetcher,
+        timezone: ZoneInfo,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._media_library = media_library
         self._state = state
         self._account = account
+        self._feed = feed
+        self._fetcher = fetcher
+        self._timezone = timezone
         self._clock = clock
 
     def run(self) -> None:
@@ -43,8 +59,49 @@ class Cycle:
         """
         ensure_writable(self._media_library)
         log.info("Cycle started")
-        self._active_subscriptions()
+        for subscription in self._active_subscriptions():
+            self._detect_new_uploads(subscription)
+            self._download_new_uploads(subscription)
         log.info("Cycle finished")
+
+    def _detect_new_uploads(self, subscription: TrackedSubscription) -> None:
+        """Remember the uploads released after the Subscription's tracking start."""
+        try:
+            uploads = self._feed.uploads(subscription.channel_id)
+        except FeedUnavailable as error:
+            log.warning(
+                "Can't read the uploads of %s (%s); trying again next cycle",
+                subscription.display_name,
+                error,
+            )
+            return
+        self._state.record_uploads(
+            subscription.channel_id,
+            (u for u in uploads if u.released > subscription.tracking_start),
+        )
+
+    def _download_new_uploads(self, subscription: TrackedSubscription) -> None:
+        folder = channel_folder(subscription.display_name, subscription.channel_id)
+        for upload in self._state.pending_uploads(subscription.channel_id):
+            # Uploads left pending before an unsubscribe fall into the gap: never fetched.
+            if upload.released <= subscription.tracking_start:
+                continue
+            base = video_base(self._media_library, folder, upload, self._timezone)
+            log.info("Downloading %s (%s)", upload.title, upload.video_id)
+            try:
+                with staged(self._media_library, upload.video_id) as staged_base:
+                    self._fetcher.fetch(upload.video_id, staged_base)
+                    file_video(staged_base, base)
+            except (FetchFailed, OSError) as error:
+                log.warning(
+                    "Downloading %s (%s) failed (%s); trying again next cycle",
+                    upload.title,
+                    upload.video_id,
+                    error,
+                )
+                continue
+            self._state.mark_downloaded(upload.video_id)
+            log.info("Downloaded %s", base.relative_to(self._media_library))
 
     def _active_subscriptions(self) -> list[TrackedSubscription]:
         """The Subscriptions to follow this cycle, synced with the account when it can be read."""

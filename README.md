@@ -103,6 +103,28 @@ If Google no longer accepts the login, e.g. because you revoked access, the daem
 ``Login has lapsed, run `login` again`` every cycle and keeps using the Subscriptions it last
 saw until you run `login` again.
 
+## Downloads
+
+Every cycle the daemon reads each active Subscription's public upload feed. Each New upload,
+i.e. a video released after the Subscription's tracking start, is downloaded anonymously with
+yt-dlp (never with your Google cookies) and filed into the Media library:
+
+```text
+<Media library>/<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>].mkv
+<Media library>/<Channel folder>/Season <YYYY>/<Channel> - <YYYY-MM-DD HH-MM> - <Title> [<videoid>]-thumb.jpg
+```
+
+- The Channel folder is named after the channel when the daemon first sees the Subscription and
+  keeps that name even if the channel is renamed later.
+- The release time is in the container's `TZ`. Characters that aren't allowed in Windows/SMB
+  filenames (colons among them) are replaced, and overlong titles are shortened.
+- Videos are the best quality up to 1080p, H.264 + AAC where YouTube offers it at that height,
+  merged into MKV with metadata and chapters embedded.
+- Downloads go to the hidden `.youtube-helper-staging` directory in the Media library first and
+  are moved into place only when complete, so a media server never sees a half-finished file.
+- Each video is downloaded once, also across restarts. A failed download is tried again the
+  next cycle.
+
 ## Configuration
 
 All configuration is passed to the container by Compose. There is no config file.
@@ -128,3 +150,6 @@ uv run ruff check && uv run ruff format --check
 uv run mypy
 uv run pytest
 ```
+
+`uv run pytest -m smoke` additionally downloads a short public video from YouTube for real; it
+needs network access, `ffmpeg` and `deno`.

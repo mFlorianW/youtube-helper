@@ -7,9 +7,11 @@
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
+
+from youtube_helper.upload_feed import Upload
 
 DATABASE_NAME = "youtube-helper.sqlite3"
 
@@ -22,6 +24,12 @@ MIGRATIONS = (
     " display_name TEXT NOT NULL,"
     " active INTEGER NOT NULL,"
     " tracking_start TEXT NOT NULL)",
+    "CREATE TABLE video ("
+    " video_id TEXT PRIMARY KEY,"
+    " channel_id TEXT NOT NULL,"
+    " title TEXT NOT NULL,"
+    " released TEXT NOT NULL,"
+    " status TEXT NOT NULL)",
 )
 
 
@@ -102,6 +110,37 @@ class StateStore:
                     (s.channel_id, s.display_name, s.active, s.tracking_start.isoformat())
                     for s in subscriptions
                 ],
+            )
+
+    def record_uploads(self, channel_id: str, uploads: Iterable[Upload]) -> None:
+        """Remember these uploads as pending, unless they are already known."""
+        with self._connection:
+            self._connection.executemany(
+                "INSERT INTO video (video_id, channel_id, title, released, status)"
+                " VALUES (?, ?, ?, ?, 'pending')"
+                " ON CONFLICT (video_id) DO NOTHING",
+                [
+                    (u.video_id, channel_id, u.title, u.released.astimezone(UTC).isoformat())
+                    for u in uploads
+                ],
+            )
+
+    def pending_uploads(self, channel_id: str) -> list[Upload]:
+        """The channel's uploads not downloaded yet, oldest first."""
+        rows = self._connection.execute(
+            "SELECT video_id, title, released FROM video"
+            " WHERE channel_id = ? AND status = 'pending' ORDER BY released",
+            (channel_id,),
+        )
+        return [
+            Upload(video_id, title, datetime.fromisoformat(released))
+            for video_id, title, released in rows
+        ]
+
+    def mark_downloaded(self, video_id: str) -> None:
+        with self._connection:
+            self._connection.execute(
+                "UPDATE video SET status = 'downloaded' WHERE video_id = ?", (video_id,)
             )
 
 
