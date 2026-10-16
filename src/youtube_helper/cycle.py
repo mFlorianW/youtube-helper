@@ -25,4 +25,6 @@ class Cycle:
         """
         ensure_writable(self._media_library)
         log.info("Cycle started")
+        if self._state.refresh_token() is None:
+            log.warning("Not logged in, run `login`")
         log.info("Cycle finished")

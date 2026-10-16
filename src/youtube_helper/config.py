@@ -27,10 +27,14 @@ def load_config(environ: Mapping[str, str]) -> Config:
     media_library = environ.get("MEDIA_LIBRARY")
     if not media_library:
         raise ConfigError("MEDIA_LIBRARY is not set; point it at the Media library root")
-    state_dir = environ.get("STATE_DIR") or DEFAULT_STATE_DIR
     timezone_name = (environ.get("TZ") or "UTC").removeprefix(":")
     try:
         timezone = ZoneInfo(timezone_name)
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise ConfigError(f"TZ {timezone_name!r} is not a known time zone") from error
-    return Config(Path(media_library), Path(state_dir), timezone)
+    return Config(Path(media_library), load_state_dir(environ), timezone)
+
+
+def load_state_dir(environ: Mapping[str, str]) -> Path:
+    """The state directory alone, for commands that need nothing else from the config."""
+    return Path(environ.get("STATE_DIR") or DEFAULT_STATE_DIR)

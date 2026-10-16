@@ -11,6 +11,8 @@
 # - create the host directories for the Media library and the state, writable by the user
 #   below (the tool never changes ownership or permissions);
 # - put the Google OAuth client ID and secret into the two secret files (see `secrets:`).
+# After the first start, log in once (see "Logging in" in the README):
+#   docker compose run --rm youtube-helper login
 
 name: youtube-helper
 

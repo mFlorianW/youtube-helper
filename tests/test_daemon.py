@@ -101,3 +101,14 @@ def test_daemon_exits_non_zero_naming_an_unusable_state_directory(
 
     assert status != 0
     assert str(missing) in caplog.text
+
+
+def test_daemon_asks_for_login_every_cycle_while_not_logged_in(
+    media_library: Path, state_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    sleep = FakeSleep(stop_after=2)
+
+    with pytest.raises(StopDaemon):
+        run_daemon(environment(media_library, state_dir), sleep=sleep)
+
+    assert caplog.text.count("Not logged in, run `login`") == 2
