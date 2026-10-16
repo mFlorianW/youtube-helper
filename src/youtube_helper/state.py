@@ -202,15 +202,23 @@ class StateStore:
         It is never fetched again, and its episode number is never handed out again.
         """
         with self._connection:
-            self._connection.execute(
-                "UPDATE video SET status = 'downloaded' WHERE video_id = ?", (video_id,)
-            )
+            self._set_status(video_id, "downloaded")
             self._connection.execute(
                 "INSERT INTO season (channel_id, season, last_episode) VALUES (?, ?, ?)"
                 " ON CONFLICT (channel_id, season) DO UPDATE"
                 " SET last_episode = max(last_episode, excluded.last_episode)",
                 (channel_id, season, episode),
             )
+
+    def mark_excluded(self, video_id: str) -> None:
+        """Remember that the video is not a regular one, so it is never fetched again."""
+        with self._connection:
+            self._set_status(video_id, "excluded")
+
+    def _set_status(self, video_id: str, status: str) -> None:
+        self._connection.execute(
+            "UPDATE video SET status = ? WHERE video_id = ?", (status, video_id)
+        )
 
 
 def _migrate(connection: sqlite3.Connection) -> None:

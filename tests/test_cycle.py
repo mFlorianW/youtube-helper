@@ -20,7 +20,7 @@ from youtube_helper.cycle import Cycle
 from youtube_helper.media_library import MediaLibraryUnwritable
 from youtube_helper.state import StateStore
 from youtube_helper.upload_feed import FeedUnavailable, Upload
-from youtube_helper.video_fetcher import FetchFailed, VideoMetadata
+from youtube_helper.video_fetcher import FetchFailed, NotAiredYet, NotRegularVideo, VideoMetadata
 
 START = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 GIB = 1024**3
@@ -902,3 +902,90 @@ def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle
     run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
 
     assert sorted(fetcher.fetched) == ["vid00000001", "vid00000002", "vid00000003"]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["a Short", "a scheduled live stream", "a running live stream", "a livestream recording"],
+)
+def test_videos_that_are_not_regular_are_excluded_and_never_evaluated_again(
+    media_library: Path,
+    state_dir: Path,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    account = FakeAccount(FIRST)
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        feed.publish("UC1", Upload("vid00000001", "Not regular", START + timedelta(minutes=5)))
+        fetcher.errors["vid00000001"] = NotRegularVideo(kind)
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    # A restart in between: a new process on the same state file.
+    with closing(StateStore.open(state_dir)) as state:
+        clock.advance()
+        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001"]
+    assert media_files(media_library) == []
+    assert caplog.text.count(f"Excluded Not regular (vid00000001): {kind}") == 1
+    assert "failed" not in caplog.text
+
+
+def test_premiere_is_skipped_while_upcoming_and_downloaded_once_aired(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Premiere", START + timedelta(minutes=5)))
+    fetcher.errors["vid00000001"] = NotAiredYet("upcoming")
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert media_files(media_library) == []
+    assert "Premiere (vid00000001) has not aired yet (upcoming)" in caplog.text
+    assert "failed" not in caplog.text
+    del fetcher.errors["vid00000001"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert fetcher.fetched == ["vid00000001"] * 3
+    basename = "First Channel - 2026-10-16 12-05 - Premiere [vid00000001]"
+    assert Path("First Channel", "Season 2026", f"{basename}.mkv") in media_files(media_library)
+
+
+def test_videos_not_downloaded_take_no_episode_number(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "Short", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Premiere", START + timedelta(minutes=6)))
+    feed.publish("UC1", Upload("vid00000003", "Regular", START + timedelta(minutes=7)))
+    fetcher.errors["vid00000001"] = NotRegularVideo("a Short")
+    fetcher.errors["vid00000002"] = NotAiredYet("upcoming")
+    clock.advance()
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    del fetcher.errors["vid00000002"]
+    clock.advance()
+
+    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+
+    assert episode_numbers(media_library) == {
+        "vid00000002": ("2026", "2"),
+        "vid00000003": ("2026", "1"),
+    }
