@@ -171,3 +171,24 @@ def test_without_a_secret_key_no_password_can_be_stored_or_read(state_dir: Path)
         assert state.email_settings().password_state is PasswordState.UNREADABLE
         with pytest.raises(ValueError, match="No secret key"):
             state.save_email_settings(EMAIL, password="swordfish")
+
+
+def test_feeds_failing_before_their_start_was_recorded_count_from_the_last_cycle(
+    state_dir: Path,
+) -> None:
+    before = MIGRATIONS.index("ALTER TABLE feed_failure ADD COLUMN since TEXT")
+    with closing(sqlite3.connect(state_dir / DATABASE_NAME, autocommit=False)) as old, old:
+        for migration in MIGRATIONS[:before]:
+            if isinstance(migration, str):
+                old.execute(migration)
+            else:
+                migration(old)
+        old.execute(
+            "INSERT INTO cycle_outcome (id, started, finished, downloaded)"
+            " VALUES (1, '2026-10-16T12:00:00+00:00', '2026-10-16T12:05:00+00:00', 0)"
+        )
+        old.execute("INSERT INTO feed_failure VALUES ('UC1', 'HTTP 500')")
+        old.execute(f"PRAGMA user_version = {before}")
+
+    with closing(StateStore.open(state_dir)) as state:
+        assert state.feeds_failing_since() == {"UC1": datetime(2026, 10, 16, 12, 0, tzinfo=UTC)}

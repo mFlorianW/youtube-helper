@@ -17,7 +17,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from youtube_helper.channels import Channel, ChannelUnavailable, NotAChannel
-from youtube_helper.notifications import EmailSettings, MailError
+from youtube_helper.notifications import Changes, EmailSettings, MailError
 from youtube_helper.state import (
     AllDownloadsFailed,
     CycleOutcome,
@@ -412,7 +412,7 @@ def test_status_warns_while_notifications_cannot_be_sent(
     assert "since 2026-10-16 14:00" in html
     assert "Nothing needs your attention" not in html
 
-    state.notification_delivered([])
+    state.notification_delivered(Changes())
 
     assert "Email can't be sent" not in status(client)
 

@@ -1564,14 +1564,18 @@ def test_problems_of_unsubscribed_channels_are_not_shown(
     assert state.download_problems(clock.now) == {}
 
 
+# Notifications of new videos only.
 EMAIL = EmailSettings(
     enabled=True,
+    warnings=False,
     host="smtp.example.org",
     port=25,
     security=Security.NONE,
     from_address="youtube-helper@example.org",
     recipients=("owner@example.org",),
 )
+# Notifications of Warnings only.
+WARNINGS = replace(EMAIL, new_videos=False, warnings=True)
 
 
 @pytest.fixture
@@ -2013,3 +2017,392 @@ def test_skipped_cycle_still_sends_what_is_unreported(
 
     [message] = mailer.sent
     assert "vid00000001" in body(message)
+
+
+def cycles(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    mailer: FakeMailer,
+    count: int = 1,
+    **fakes: FakeFeed | FakeFetcher | FakeDisk,
+) -> list[EmailMessage]:
+    """Run `count` cycles half an hour apart; return the Notifications they sent."""
+    sent_before = len(mailer.sent)
+    for _ in range(count):
+        clock.advance()
+        run_cycle(media_library, state, clock, mailer=mailer, **fakes)  # type: ignore[arg-type]
+    return mailer.sent[sent_before:]
+
+
+def subjects(messages: list[EmailMessage]) -> list[str]:
+    return [message["Subject"] for message in messages]
+
+
+def test_low_free_space_is_reported_when_raised_and_when_cleared(
+    media_library: Path, state: StateStore, clock: FakeClock, mailer: FakeMailer
+) -> None:
+    state.save_email_settings(WARNINGS)
+    disk = FakeDisk(free=9 * GIB)
+
+    raised = cycles(media_library, state, clock, mailer, disk=disk)
+    still = cycles(media_library, state, clock, mailer, 3, disk=disk)
+    disk.free = 100 * GIB
+    cleared = cycles(media_library, state, clock, mailer, disk=disk)
+    after = cycles(media_library, state, clock, mailer, 3, disk=disk)
+
+    assert subjects(raised) == ["youtube-helper: ⚠ Low free space"]
+    assert body(raised[0]) == (
+        "⚠ Raised\n"
+        "\n"
+        "- Only 9.0 GiB free in the Media library, less than 10.0 GiB: downloads are paused,"
+        " New uploads stay pending until there is more room.\n"
+    )
+    assert still == []
+    assert subjects(cleared) == ["youtube-helper: Low free space cleared"]
+    assert body(cleared[0]) == "✓ Cleared\n\n- Low free space\n"
+    assert after == []
+
+
+def test_unwritable_media_library_is_reported_when_raised_and_when_cleared(
+    tmp_path: Path, state: StateStore, clock: FakeClock, mailer: FakeMailer
+) -> None:
+    state.save_email_settings(WARNINGS)
+    library = tmp_path / "library"
+
+    raised = cycles(library, state, clock, mailer)
+    still = cycles(library, state, clock, mailer, 2)
+    library.mkdir()
+    cleared = cycles(library, state, clock, mailer)
+
+    assert subjects(raised) == ["youtube-helper: ⚠ Media library not writable"]
+    assert (
+        f"- Media library {library} is not writable: No such file or directory;"
+        " cycles are skipped until it is writable again." in body(raised[0])
+    )
+    assert still == []
+    assert subjects(cleared) == ["youtube-helper: Media library not writable cleared"]
+
+
+def test_all_downloads_failing_is_reported_with_the_bot_check_hint_until_one_succeeds(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    mailer: FakeMailer,
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    feed.publish("UC1", Upload("vid00000001", "Blocked", START + timedelta(minutes=1)))
+    fetcher.errors["vid00000001"] = BotCheck("Sign in to confirm you're not a bot")
+
+    raised = cycles(media_library, state, clock, mailer, feed=feed, fetcher=fetcher)
+    still = cycles(media_library, state, clock, mailer, 2, feed=feed, fetcher=fetcher)
+    del fetcher.errors["vid00000001"]
+    cleared = cycles(media_library, state, clock, mailer, feed=feed, fetcher=fetcher)
+
+    assert subjects(raised) == ["youtube-helper: ⚠ All downloads failing"]
+    assert (
+        "- All downloads failing (1 in the last cycle that tried any, last error: Sign in to"
+        " confirm you're not a bot): yt-dlp is likely outdated, pull the latest image."
+        " YouTube asked 1 of them for a bot check. If this keeps happening, a PO-token provider"
+        " is needed.\n" in body(raised[0])
+    )
+    assert still == []
+    assert subjects(cleared) == ["youtube-helper: All downloads failing cleared"]
+
+
+def test_unreadable_feed_is_a_warning_only_once_it_failed_for_24_hours(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST, SECOND)
+    state.save_email_settings(WARNINGS)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    first_failure = cycles(media_library, state, clock, mailer, feed=feed)
+    hiccup_feed = FakeFeed()
+    hiccup_feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    hiccup_feed.channels["UC2"] = FeedUnavailable("HTTP 502")
+    # A hiccup of the other Subscription's feed, fine again the next cycle.
+    hiccup = cycles(media_library, state, clock, mailer, feed=hiccup_feed)
+
+    # 24 hours after the first failure: 47 more cycles.
+    before = cycles(media_library, state, clock, mailer, 46, feed=feed)
+    raised = cycles(media_library, state, clock, mailer, feed=feed)
+    still = cycles(media_library, state, clock, mailer, 2, feed=feed)
+    del feed.channels["UC1"]
+    cleared = cycles(media_library, state, clock, mailer, feed=feed)
+
+    assert first_failure == hiccup == before == still == []
+    assert subjects(raised) == ["youtube-helper: ⚠ Feed of First Channel unreadable"]
+    assert (
+        "- The upload feed of First Channel can't be read since 2026-10-16 12:30 UTC: HTTP 500"
+        in body(raised[0])
+    )
+    assert subjects(cleared) == ["youtube-helper: Feed of First Channel unreadable cleared"]
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.feed_failures == {}
+
+
+def test_warning_of_a_removed_subscription_disappears_without_being_reported_cleared(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    raised = cycles(media_library, state, clock, mailer, 49, feed=feed)
+
+    state.unsubscribe("UC1")
+    after = cycles(media_library, state, clock, mailer, 2, feed=feed)
+    subscribe(state, clock, FIRST)
+    again = cycles(media_library, state, clock, mailer, 49, feed=feed)
+
+    assert subjects(raised) == ["youtube-helper: ⚠ Feed of First Channel unreadable"]
+    assert after == []
+    assert subjects(again) == ["youtube-helper: ⚠ Feed of First Channel unreadable"]
+
+
+def test_feed_of_a_subscription_made_again_fails_for_24_hours_before_it_is_a_warning(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    cycles(media_library, state, clock, mailer, 48, feed=feed)
+
+    # Removed and made again between two cycles.
+    state.unsubscribe("UC1")
+    subscribe(state, clock, FIRST)
+    soon = cycles(media_library, state, clock, mailer, 48, feed=feed)
+    later = cycles(media_library, state, clock, mailer, feed=feed)
+
+    assert soon == []
+    assert subjects(later) == ["youtube-helper: ⚠ Feed of First Channel unreadable"]
+
+
+def test_video_given_up_on_or_skipped_is_reported_once_and_never_as_cleared(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    mailer: FakeMailer,
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    feed.publish("UC1", Upload("vid00000001", "Doomed", START + timedelta(minutes=1)))
+    feed.publish("UC1", Upload("vid00000002", "Private", START + timedelta(minutes=2)))
+    feed.publish("UC1", Upload("vid00000003", "Fine", START + timedelta(minutes=3)))
+    # Not a yt-dlp failure, so it doesn't raise All downloads failing while it is retried.
+    fetcher.errors["vid00000001"] = OSError("No space left on device")
+    fetcher.errors["vid00000002"] = VideoUnavailable("Private video")
+
+    skipped = cycles(media_library, state, clock, mailer, feed=feed, fetcher=fetcher)
+    retried = cycles(media_library, state, clock, mailer, 47, feed=feed, fetcher=fetcher)
+    gave_up = cycles(media_library, state, clock, mailer, feed=feed, fetcher=fetcher)
+    after = cycles(media_library, state, clock, mailer, 3, feed=feed, fetcher=fetcher)
+
+    assert subjects(skipped) == ["youtube-helper: ⚠ Skipped Private"]
+    assert body(skipped[0]) == (
+        "⚠ Raised\n"
+        "\n"
+        "- Skipped Private (First Channel) for good: Private video\n"
+        "  https://www.youtube.com/watch?v=vid00000002\n"
+    )
+    assert retried == []
+    assert subjects(gave_up) == ["youtube-helper: ⚠ Gave up on Doomed"]
+    assert (
+        "- Gave up on Doomed (First Channel) after failing for 24 hours: No space left on device\n"
+        "  https://www.youtube.com/watch?v=vid00000001\n" in body(gave_up[0])
+    )
+    assert after == []
+
+
+def test_one_notification_holds_raised_then_cleared_warnings_then_new_videos(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(replace(EMAIL, warnings=True))
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    cycles(media_library, state, clock, mailer, 49, feed=feed)
+    feed.channels["UC1"] = [
+        Upload("vid00000002", "Two", clock.now + timedelta(minutes=2)),
+        Upload("vid00000001", "One", clock.now + timedelta(minutes=1)),
+    ]
+    # Room for one download only: free space is short before the second.
+    disk = FakeDisk(free=10 * GIB + GIB // 2)
+    fetcher = FakeFetcher()
+    fetcher.disk = disk
+
+    [message] = cycles(media_library, state, clock, mailer, feed=feed, fetcher=fetcher, disk=disk)
+
+    assert message["Subject"] == (
+        "youtube-helper: ⚠ Low free space, Feed of First Channel unreadable cleared, 1 new video"
+    )
+    content = body(message)
+    assert content.index("⚠ Raised") < content.index("✓ Cleared") < content.index("1 new video")
+
+
+def test_subject_counts_the_warnings_cleared(
+    tmp_path: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    library = tmp_path / "library"
+    library.mkdir()
+    disk = FakeDisk(free=GIB)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    cycles(library, state, clock, mailer, 49, feed=feed, disk=disk)
+    library.rmdir()
+
+    [raised] = cycles(library, state, clock, mailer)
+    library.mkdir()
+    disk.free = 100 * GIB
+    del feed.channels["UC1"]
+    [cleared] = cycles(library, state, clock, mailer, feed=feed, disk=disk)
+
+    assert raised["Subject"] == "youtube-helper: ⚠ Media library not writable"
+    assert cleared["Subject"] == "youtube-helper: 3 Warnings cleared"
+
+
+def test_subject_names_the_first_raised_warning_and_counts_the_others(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    cycles(media_library, state, clock, mailer, 48, feed=feed)
+
+    [message] = cycles(media_library, state, clock, mailer, feed=feed, disk=FakeDisk(free=GIB))
+
+    assert message["Subject"] == "youtube-helper: ⚠ Low free space and 1 more Warning"
+    content = body(message)
+    assert content.index("Only 1.0 GiB free") < content.index("The upload feed of First")
+
+
+def test_warning_raised_and_cleared_while_email_fails_is_never_reported(
+    media_library: Path, state: StateStore, clock: FakeClock, mailer: FakeMailer
+) -> None:
+    state.save_email_settings(WARNINGS)
+    disk = FakeDisk(free=100 * GIB)
+    mailer.error = MailError("timed out")
+    disk.free = GIB
+    cycles(media_library, state, clock, mailer, 2, disk=disk)
+    disk.free = 100 * GIB
+    cycles(media_library, state, clock, mailer, 2, disk=disk)
+
+    mailer.error = None
+    after = cycles(media_library, state, clock, mailer, 3, disk=disk)
+
+    assert after == []
+    assert state.notification_failure() is not None
+
+
+def test_warning_cleared_while_email_fails_is_reported_cleared_once_email_works(
+    media_library: Path, state: StateStore, clock: FakeClock, mailer: FakeMailer
+) -> None:
+    state.save_email_settings(WARNINGS)
+    disk = FakeDisk(free=GIB)
+    [raised] = cycles(media_library, state, clock, mailer, disk=disk)
+    mailer.error = MailError("timed out")
+    disk.free = 100 * GIB
+    cycles(media_library, state, clock, mailer, 2, disk=disk)
+
+    mailer.error = None
+    [cleared] = cycles(media_library, state, clock, mailer, disk=disk)
+
+    assert raised["Subject"] == "youtube-helper: ⚠ Low free space"
+    assert cleared["Subject"] == "youtube-helper: Low free space cleared"
+    assert body(cleared).startswith("Notifications were failing since")
+    assert state.notification_failure() is None
+
+
+@pytest.mark.parametrize(
+    "before", [replace(WARNINGS, enabled=False), replace(WARNINGS, warnings=False)]
+)
+def test_switching_warnings_on_reports_those_already_active_once(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    mailer: FakeMailer,
+    before: EmailSettings,
+) -> None:
+    state.save_email_settings(before)
+    disk = FakeDisk(free=GIB)
+    off = cycles(media_library, state, clock, mailer, 2, disk=disk)
+
+    state.save_email_settings(WARNINGS)
+    on = cycles(media_library, state, clock, mailer, 3, disk=disk)
+
+    assert off == []
+    assert subjects(on) == ["youtube-helper: ⚠ Low free space"]
+
+
+def test_switching_warnings_on_does_not_report_videos_given_up_before(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    mailer: FakeMailer,
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(replace(WARNINGS, warnings=False))
+    feed.publish("UC1", Upload("vid00000001", "Private", START + timedelta(minutes=1)))
+    feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=2)))
+    fetcher.errors["vid00000001"] = VideoUnavailable("Private video")
+    cycles(media_library, state, clock, mailer, feed=feed, fetcher=fetcher)
+
+    state.save_email_settings(WARNINGS)
+    on = cycles(media_library, state, clock, mailer, 2, feed=feed, fetcher=fetcher)
+
+    assert on == []
+
+
+def test_warnings_are_not_reported_when_switched_off(
+    media_library: Path, state: StateStore, clock: FakeClock, mailer: FakeMailer
+) -> None:
+    state.save_email_settings(EMAIL)
+
+    sent = cycles(media_library, state, clock, mailer, 2, disk=FakeDisk(free=GIB))
+
+    assert sent == []
+
+
+def test_new_videos_are_not_reported_with_only_warnings_switched_on(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1)))
+
+    sent = cycles(media_library, state, clock, mailer, 2, feed=feed)
+
+    assert sent == []
+
+
+def test_email_failure_warnings_are_never_emailed(
+    media_library: Path, state: StateStore, clock: FakeClock, mailer: FakeMailer
+) -> None:
+    state.save_email_settings(WARNINGS)
+    mailer.error = MailError("timed out")
+    cycles(media_library, state, clock, mailer, disk=FakeDisk(free=GIB))
+
+    mailer.error = None
+    [message] = cycles(media_library, state, clock, mailer, disk=FakeDisk(free=GIB))
+
+    assert "Email can't be sent" not in body(message)
+
+
+def test_warnings_not_yet_reported_survive_a_restart(
+    media_library: Path, state_dir: Path, clock: FakeClock, mailer: FakeMailer
+) -> None:
+    with closing(StateStore.open(state_dir)) as state:
+        state.save_email_settings(WARNINGS)
+        cycles(media_library, state, clock, mailer, disk=FakeDisk(free=GIB))
+
+    with closing(StateStore.open(state_dir)) as state:
+        after = cycles(media_library, state, clock, mailer, 2, disk=FakeDisk(free=100 * GIB))
+
+    assert subjects(after) == ["youtube-helper: Low free space cleared"]
