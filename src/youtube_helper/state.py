@@ -18,6 +18,8 @@ from youtube_helper.channels import Channel
 from youtube_helper.media_library import channel_folder
 from youtube_helper.notifications import (
     EmailSettings,
+    FiledVideo,
+    NotificationFailure,
     PasswordCipher,
     PasswordState,
     SavedEmailSettings,
@@ -96,6 +98,12 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     " password TEXT,"
     " from_address TEXT NOT NULL,"
     " recipients TEXT NOT NULL)",
+    # Filed into the Media library, but not yet reported in a delivered Notification.
+    "ALTER TABLE video ADD COLUMN unreported INTEGER NOT NULL DEFAULT 0",
+    "CREATE TABLE notification_failure ("
+    " id INTEGER PRIMARY KEY CHECK (id = 1),"
+    " since TEXT NOT NULL,"
+    " warning TEXT NOT NULL)",
 )
 
 # How long videos given up or skipped are still shown as problems.
@@ -339,10 +347,14 @@ class StateStore:
     def mark_downloaded(self, video_id: str, channel_id: str, season: int, episode: int) -> None:
         """Remember that the video is in the Media library as this episode of `season`.
 
-        It is never fetched again, and its episode number is never handed out again.
+        It is never fetched again, and its episode number is never handed out again. It is
+        unreported until a Notification reporting it is delivered.
         """
         with self._transaction() as connection:
-            self._set_status(video_id, "downloaded")
+            connection.execute(
+                "UPDATE video SET status = 'downloaded', unreported = 1 WHERE video_id = ?",
+                (video_id,),
+            )
             connection.execute(
                 "INSERT INTO season (channel_id, season, last_episode) VALUES (?, ?, ?)"
                 " ON CONFLICT (channel_id, season) DO UPDATE"
@@ -478,6 +490,56 @@ class StateStore:
             feed_failures,
         )
 
+    def unreported_videos(self) -> list[FiledVideo]:
+        """The videos filed and not reported yet, by Subscription in the order first made,
+        oldest first."""
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT video_id, video.channel_id, display_name, title, released"
+                " FROM video JOIN subscription USING (channel_id)"
+                " WHERE unreported ORDER BY subscription.rowid, released"
+            ).fetchall()
+        return [
+            FiledVideo(video_id, channel_id, subscription, title, datetime.fromisoformat(released))
+            for video_id, channel_id, subscription, title, released in rows
+        ]
+
+    def notification_delivered(self, video_ids: Iterable[str]) -> None:
+        """Remember that a Notification reporting these videos was delivered: Notifications
+        work again."""
+        with self._transaction() as connection:
+            connection.executemany(
+                "UPDATE video SET unreported = 0 WHERE video_id = ?",
+                [(video_id,) for video_id in video_ids],
+            )
+            connection.execute("DELETE FROM notification_failure")
+
+    def notification_failed(self, warning: str, at: datetime) -> None:
+        """Remember that a Notification couldn't be sent at `at`, and why, as a Warning.
+
+        Notifications count as failing since the first failure after the last one delivered.
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO notification_failure (id, since, warning) VALUES (1, ?, ?)"
+                " ON CONFLICT (id) DO UPDATE SET warning = excluded.warning",
+                (_utc(at), warning),
+            )
+
+    def clear_notification_failure(self) -> None:
+        """Forget that Notifications were failing: none are sent any more."""
+        with self._transaction() as connection:
+            connection.execute("DELETE FROM notification_failure")
+
+    def notification_failure(self) -> NotificationFailure | None:
+        """Since when and why Notifications are failing, or None if they aren't."""
+        with self._transaction() as connection:
+            row = connection.execute("SELECT since, warning FROM notification_failure").fetchone()
+        if row is None:
+            return None
+        since, warning = row
+        return NotificationFailure(datetime.fromisoformat(since), warning)
+
     @property
     def can_store_password(self) -> bool:
         """Whether there is a key to encrypt the SMTP password with."""
@@ -502,15 +564,20 @@ class StateStore:
 
         The stored password is dropped when the host, port, security or username change: the
         tool decrypts it to send it, so it must not follow the settings to someone else's server.
+        Switching on Notifications of new videos counts every video filed so far as reported.
         """
         if password is not None and self._cipher is None:
             raise ValueError("No secret key to encrypt the SMTP password with")
         with self._transaction() as connection:
             token = None
+            stored = EmailSettings()
             if row := connection.execute(_SELECT_EMAIL_SETTINGS).fetchone():
                 stored, stored_token = _email_settings(row)
                 if stored.same_server(settings):
                     token = stored_token
+            if settings.reports_new_videos and not stored.reports_new_videos:
+                connection.execute("UPDATE video SET unreported = 0")
+                connection.execute("DELETE FROM notification_failure")
             if password is not None and self._cipher is not None:
                 token = self._cipher.encrypt(password)
             connection.execute(

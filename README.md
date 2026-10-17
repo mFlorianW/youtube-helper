@@ -82,6 +82,9 @@ The page shows what the last cycle did, refreshed on its own every 30 seconds:
   - **Low free space**: the free space in the Media library and the 10 GiB threshold below
     which downloads are paused.
   - **Media library not writable**, naming the directory: cycles are skipped until it is.
+  - **Email can't be sent**, with the SMTP error, or the stored SMTP password can't be
+    decrypted: since when [Notifications](#new-videos) are failing. It clears once one is
+    delivered, or Notifications are switched off.
 
 Each Subscription lists its own problems:
 
@@ -95,8 +98,7 @@ database, so it survives restarts.
 ## Notifications
 
 The **Notifications** page of the web UI holds all email settings; none of them are set in the
-deployment. They are kept in the state database. Notifications themselves aren't sent yet:
-for now the page only stores the settings and sends a test email.
+deployment. They are kept in the state database.
 
 - **Email Notifications** switches them on or off; off by default. **New videos** and
   **Warnings** choose what they report; both are ticked by default.
@@ -111,6 +113,23 @@ for now the page only stores the settings and sends a test email.
 Saving checks that the addresses are well-formed and, while Email Notifications are switched
 on, that a host, a From address and a recipient are set. **Send test email** sends one right
 away with the saved settings and shows the result or the SMTP server's error.
+
+### New videos
+
+At the end of each cycle, with Email Notifications and **New videos** switched on, youtube-helper
+sends one plain-text email listing the videos filed into the Media library since the last
+Notification that was delivered, e.g. `youtube-helper: 3 new videos`. The videos are grouped by
+Subscription, each with its title, air date and YouTube link. A cycle that filed nothing sends
+nothing.
+
+When Notifications are switched on, only videos filed from then on are reported, never those
+already in the Media library. If an email can't be sent (the SMTP server is down, the login is
+refused, or the stored password can't be decrypted), the error is logged and shown on the
+Subscriptions page as a Warning, and the videos are kept for the next Notification. That one,
+once delivered, covers everything since the last one that got through, says since when
+Notifications were failing, and clears the Warning: after an outage you get one catch-up email,
+not a burst. A failing email never breaks a cycle: an SMTP server that doesn't answer is given
+up on after 30 seconds.
 
 ### The SMTP password
 

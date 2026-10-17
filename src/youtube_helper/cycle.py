@@ -26,6 +26,13 @@ from youtube_helper.media_library import (
     video_base,
 )
 from youtube_helper.nfo import episode_nfo, tvshow_nfo
+from youtube_helper.notifications import (
+    Mailer,
+    MailError,
+    failure_warning,
+    new_videos_notification,
+    send_email,
+)
 from youtube_helper.state import (
     AllDownloadsFailed,
     CycleOutcome,
@@ -68,6 +75,7 @@ class Cycle:
         feed: UploadFeed,
         fetcher: VideoFetcher,
         artwork: Artwork,
+        mailer: Mailer,
         timezone: ZoneInfo,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         free_space: Callable[[Path], int] = free_space,
@@ -78,14 +86,16 @@ class Cycle:
         self._feed = feed
         self._fetcher = fetcher
         self._artwork = artwork
+        self._mailer = mailer
         self._timezone = timezone
         self._clock = clock
         self._free_space = free_space
 
     def run(self) -> None:
-        """Run one cycle and record its outcome in the state store.
+        """Run one cycle, record its outcome in the state store and send the Notification.
 
-        The cycle is skipped, and only that recorded, if the Media library can't be written.
+        The cycle is skipped, and only that recorded and notified, if the Media library can't be
+        written.
         A warning the cycle didn't look into stays as the cycle before recorded it.
         """
         started = self._clock()
@@ -103,6 +113,7 @@ class Cycle:
                     unwritable=str(error),
                 )
             )
+            self._notify()
             return
         log.info("Cycle started")
         subscriptions = [self._refresh_details(s) for s in self._active_subscriptions()]
@@ -128,7 +139,38 @@ class Cycle:
                 feed_failures=feed_failures,
             )
         )
+        self._notify()
         log.info("Cycle finished")
+
+    def _notify(self) -> None:
+        """Send the Notification of the videos filed since the last one delivered, if any.
+
+        One that can't be sent is a Warning; its videos are reported by the next one delivered.
+        """
+        saved = self._state.email_settings()
+        if not saved.settings.reports_new_videos:
+            self._state.clear_notification_failure()
+            return
+        filed = self._state.unreported_videos()
+        if not filed:
+            return
+        failure = self._state.notification_failure()
+        subject, content = new_videos_notification(filed, failure, self._timezone)
+        try:
+            send_email(
+                saved,
+                self._mailer,
+                subject,
+                content,
+                can_store_password=self._state.can_store_password,
+            )
+        except MailError as error:
+            warning = failure_warning(error)
+            log.error("%s; trying again next cycle", warning)
+            self._state.notification_failed(warning, self._clock())
+            return
+        self._state.notification_delivered(video.video_id for video in filed)
+        log.info("Sent the Notification of %s to %s", subject, ", ".join(saved.settings.recipients))
 
     def _low_space(self) -> LowSpace | None:
         """Why there is no room for the next download, logged; None if there is room."""

@@ -2,18 +2,22 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-"""Email Notifications: their settings, the SMTP password's encryption and the test email."""
+"""Email Notifications: their settings, the SMTP password's encryption, the test email and the
+Notifications of new videos."""
 
 import base64
 import hashlib
 import re
 import smtplib
 import ssl
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from email.message import EmailMessage
 from enum import Enum
+from itertools import groupby
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -46,6 +50,11 @@ class EmailSettings:
     def complete(self) -> bool:
         """Whether there is a server to send over, a sender and someone to send to."""
         return bool(self.host and self.from_address and self.recipients)
+
+    @property
+    def reports_new_videos(self) -> bool:
+        """Whether Notifications report the videos filed into the Media library."""
+        return self.enabled and self.new_videos
 
     def same_server(self, other: EmailSettings) -> bool:
         """Whether `other` logs into the same server as the same user: the password still fits."""
@@ -167,6 +176,10 @@ class MailError(Exception):
     """An email couldn't be sent; the message says why, for the owner."""
 
 
+class PasswordUnreadable(MailError):
+    """The stored SMTP password can't be decrypted with the current secret key."""
+
+
 class Mailer(Protocol):
     def send(self, settings: EmailSettings, password: str | None, message: EmailMessage) -> None:
         """Send `message` over the SMTP server in `settings`, logging in if there is a username.
@@ -198,14 +211,23 @@ class SmtpMailer:
                 if settings.username and password is not None:
                     smtp.login(settings.username, password)
                 smtp.send_message(message)
-        except (smtplib.SMTPException, OSError) as error:
+        # ValueError: e.g. a username or password smtplib can't encode.
+        except (smtplib.SMTPException, OSError, ValueError) as error:
             raise MailError(str(error) or type(error).__name__) from error
 
 
-def send_test_email(saved: SavedEmailSettings, mailer: Mailer, *, can_store_password: bool) -> str:
-    """Send a test email with the saved settings; return what to tell the owner.
+def send_email(
+    saved: SavedEmailSettings,
+    mailer: Mailer,
+    subject: str,
+    content: str,
+    *,
+    can_store_password: bool,
+) -> None:
+    """Send a plain-text email to the recipients with the saved settings.
 
-    Raises MailError if it can't be sent, also when the settings aren't complete enough to try.
+    Raises MailError if it can't be sent, also when the settings aren't complete enough to try,
+    and PasswordUnreadable if the stored password can't be decrypted with the current key.
     """
     settings = saved.settings
     if not settings.complete:
@@ -213,13 +235,81 @@ def send_test_email(saved: SavedEmailSettings, mailer: Mailer, *, can_store_pass
     if saved.password_state is PasswordState.UNREADABLE:
         if not can_store_password:
             raise MailError("Set SECRET_KEY_FILE to use the stored password")
-        raise MailError(UNREADABLE_PASSWORD)
+        raise PasswordUnreadable(UNREADABLE_PASSWORD)
     message = EmailMessage()
-    message["Subject"] = "youtube-helper: test email"
+    message["Subject"] = subject
     message["From"] = settings.from_address
     message["To"] = ", ".join(settings.recipients)
-    message.set_content(
-        "This is a test email from youtube-helper. If you can read it, its email settings work."
-    )
+    message.set_content(content)
     mailer.send(settings, saved.password, message)
-    return f"Test email sent to {', '.join(settings.recipients)}."
+
+
+def send_test_email(saved: SavedEmailSettings, mailer: Mailer, *, can_store_password: bool) -> str:
+    """Send a test email with the saved settings; return what to tell the owner.
+
+    Raises MailError if it can't be sent, also when the settings aren't complete enough to try.
+    """
+    send_email(
+        saved,
+        mailer,
+        "youtube-helper: test email",
+        "This is a test email from youtube-helper. If you can read it, its email settings work.",
+        can_store_password=can_store_password,
+    )
+    return f"Test email sent to {', '.join(saved.settings.recipients)}."
+
+
+@dataclass(frozen=True)
+class FiledVideo:
+    """A video filed into the Media library and not reported in a delivered Notification yet."""
+
+    video_id: str
+    channel_id: str
+    subscription: str
+    title: str
+    released: datetime
+
+
+@dataclass(frozen=True)
+class NotificationFailure:
+    """Notifications have failed since `since`; `warning` says why, as the Subscriptions page
+    shows it."""
+
+    since: datetime
+    warning: str
+
+
+def failure_warning(error: MailError) -> str:
+    """The Warning a Notification that couldn't be sent raises."""
+    if isinstance(error, PasswordUnreadable):
+        return "SMTP password can't be decrypted with the current secret key; enter it again"
+    return f"Email can't be sent: {error}"
+
+
+def new_videos_notification(
+    filed: Sequence[FiledVideo], failure: NotificationFailure | None, timezone: ZoneInfo
+) -> tuple[str, str]:
+    """The subject and plain text of the Notification reporting `filed`, grouped by Subscription
+    in the order given.
+
+    After a failure, it says since when Notifications were failing.
+    """
+    count = f"{len(filed)} new video{'' if len(filed) == 1 else 's'}"
+    lines = []
+    if failure is not None:
+        since = failure.since.astimezone(timezone).strftime("%Y-%m-%d %H:%M %Z")
+        lines += [
+            f"Notifications were failing since {since}; this one covers everything since then.",
+            "",
+        ]
+    lines.append(f"{count} {'was' if len(filed) == 1 else 'were'} filed into the Media library.")
+    for _, group in groupby(filed, key=lambda video: video.channel_id):
+        videos = list(group)
+        lines += ["", videos[0].subscription, ""]
+        for video in videos:
+            aired = video.released.astimezone(timezone).date().isoformat()
+            lines += [
+                f"- {video.title} (aired {aired})",
+                f"  https://www.youtube.com/watch?v={video.video_id}",
+            ]
+    return f"youtube-helper: {count}", "\n".join(lines) + "\n"
