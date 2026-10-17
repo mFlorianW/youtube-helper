@@ -58,8 +58,9 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
             closing(StateStore.open(config.state_dir, secret_key=config.secret_key)) as state,
             httpx.Client(timeout=HTTP_TIMEOUT) as http,
         ):
+            mailer = SmtpMailer()
             try:
-                app = create_app(state, resolver, timezone=config.timezone, mailer=SmtpMailer())
+                app = create_app(state, resolver, timezone=config.timezone, mailer=mailer)
                 serve(app, config.web_port)
             except OSError as error:
                 raise WebUnavailable(config.web_port, error) from error
@@ -70,6 +71,7 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
                 feed=YouTubeFeed(http),
                 fetcher=YtDlpFetcher(),
                 artwork=HttpArtwork(http),
+                mailer=mailer,
                 timezone=config.timezone,
             )
             while True:

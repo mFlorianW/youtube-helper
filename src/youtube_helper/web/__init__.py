@@ -74,6 +74,7 @@ def create_app(
             "subscriptions": active(),
             "outcome": state.last_cycle(),
             "problems": state.download_problems(clock()),
+            "notification_failure": state.notification_failure(),
         }
 
     async def render(request: Request, template: str, **context: object) -> Response:

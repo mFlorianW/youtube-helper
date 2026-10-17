@@ -400,6 +400,23 @@ def test_status_names_an_unwritable_media_library(client: TestClient, state: Sta
     assert "cycles are skipped until it is" in html
 
 
+def test_status_warns_while_notifications_cannot_be_sent(
+    client: TestClient, state: StateStore
+) -> None:
+    state.record_cycle(LAST_CYCLE)
+    state.notification_failed("Email can't be sent: [Errno 111] Connection refused", START)
+
+    html = status(client)
+
+    assert "Email can't be sent: [Errno 111] Connection refused" in html
+    assert "since 2026-10-16 14:00" in html
+    assert "Nothing needs your attention" not in html
+
+    state.notification_delivered([])
+
+    assert "Email can't be sent" not in status(client)
+
+
 def failing(state: StateStore, video_id: str, title: str, error: str, at: datetime) -> None:
     """Record a New upload of First Channel whose download failed at `at`."""
     state.record_uploads("UC1", [Upload(video_id, title, START + timedelta(minutes=5))])

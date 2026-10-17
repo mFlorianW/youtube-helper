@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ import pytest
 from youtube_helper.artwork import ArtworkUnavailable
 from youtube_helper.channels import Channel, ChannelUnavailable
 from youtube_helper.cycle import Cycle
+from youtube_helper.notifications import EmailSettings, MailError, NotificationFailure, Security
 from youtube_helper.state import (
     DATABASE_NAME,
     MIGRATIONS,
@@ -135,6 +137,19 @@ class FakeArtwork:
         return f"image {url}".encode()
 
 
+class FakeMailer:
+    """Records the emails sent, or fails with the error set on it."""
+
+    def __init__(self) -> None:
+        self.sent: list[EmailMessage] = []
+        self.error: MailError | None = None
+
+    def send(self, settings: EmailSettings, password: str | None, message: EmailMessage) -> None:
+        if self.error is not None:
+            raise self.error
+        self.sent.append(message)
+
+
 def subscribe(state: StateStore, clock: FakeClock | None, *channels: Channel) -> None:
     """Subscribe to the channels, as the owner does in the web UI, at the clock's time."""
     for channel in channels:
@@ -211,6 +226,7 @@ def run_cycle(
     fetcher: FakeFetcher | None = None,
     artwork: FakeArtwork | None = None,
     disk: FakeDisk | None = None,
+    mailer: FakeMailer | None = None,
     timezone: ZoneInfo = UTC_ZONE,
 ) -> None:
     Cycle(
@@ -223,6 +239,7 @@ def run_cycle(
         timezone=timezone,
         clock=clock or FakeClock(),
         free_space=disk or FakeDisk(),
+        mailer=mailer or FakeMailer(),
     ).run()
 
 
@@ -1545,3 +1562,454 @@ def test_problems_of_unsubscribed_channels_are_not_shown(
     clock.advance()
     subscribe(state, clock, FIRST)
     assert state.download_problems(clock.now) == {}
+
+
+EMAIL = EmailSettings(
+    enabled=True,
+    host="smtp.example.org",
+    port=25,
+    security=Security.NONE,
+    from_address="youtube-helper@example.org",
+    recipients=("owner@example.org",),
+)
+
+
+@pytest.fixture
+def mailer() -> FakeMailer:
+    return FakeMailer()
+
+
+def file_videos(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    mailer: FakeMailer,
+    *uploads: tuple[str, Upload],
+) -> None:
+    """Run a cycle half an hour later that files `uploads`, each published by its channel ID."""
+    for channel_id, upload in uploads:
+        feed.publish(channel_id, upload)
+    clock.advance()
+    run_cycle(media_library, state, clock, feed=feed, mailer=mailer)
+
+
+def body(message: EmailMessage) -> str:
+    content = message.get_content()
+    assert isinstance(content, str)
+    return content
+
+
+def test_cycle_sends_one_notification_listing_the_videos_it_filed_by_subscription(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST, SECOND)
+    state.save_email_settings(EMAIL)
+
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC2", Upload("vid00000003", "Three", START + timedelta(minutes=3))),
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+        ("UC1", Upload("vid00000002", "Two", START + timedelta(days=-1, minutes=2))),
+        ("UC1", Upload("vid00000004", "Four", START + timedelta(minutes=4))),
+    )
+
+    [message] = mailer.sent
+    assert message["Subject"] == "youtube-helper: 3 new videos"
+    assert message["From"] == "youtube-helper@example.org"
+    assert message["To"] == "owner@example.org"
+    assert body(message) == (
+        "3 new videos were filed into the Media library.\n"
+        "\n"
+        "First Channel\n"
+        "\n"
+        "- One (aired 2026-10-16)\n"
+        "  https://www.youtube.com/watch?v=vid00000001\n"
+        "- Four (aired 2026-10-16)\n"
+        "  https://www.youtube.com/watch?v=vid00000004\n"
+        "\n"
+        "Second Channel\n"
+        "\n"
+        "- Three (aired 2026-10-16)\n"
+        "  https://www.youtube.com/watch?v=vid00000003\n"
+    )
+
+
+def test_notification_of_a_single_video_says_video(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+
+    [message] = mailer.sent
+    assert message["Subject"] == "youtube-helper: 1 new video"
+    assert body(message).startswith("1 new video was filed into the Media library.\n")
+
+
+def test_air_date_is_the_local_one(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    feed.publish("UC1", Upload("vid00000001", "Late", START + timedelta(hours=11)))
+    clock.advance(timedelta(hours=12))
+
+    run_cycle(
+        media_library, state, clock, feed=feed, mailer=mailer, timezone=ZoneInfo("Asia/Tokyo")
+    )
+
+    # 23:00 UTC is 08:00 the next day in Tokyo.
+    assert "- Late (aired 2026-10-17)" in body(mailer.sent[0])
+
+
+def test_each_video_is_reported_once(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000002", "Two", START + timedelta(minutes=31))),
+    )
+    clock.advance()
+    run_cycle(media_library, state, clock, feed=feed, mailer=mailer)
+
+    assert [m["Subject"] for m in mailer.sent] == [
+        "youtube-helper: 1 new video",
+        "youtube-helper: 1 new video",
+    ]
+    assert "vid00000001" not in body(mailer.sent[1])
+    assert "vid00000002" in body(mailer.sent[1])
+
+
+def test_no_notification_when_nothing_was_filed(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    mailer: FakeMailer,
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    feed.publish("UC1", Upload("vid00000001", "Broken", START + timedelta(minutes=1)))
+    fetcher.errors["vid00000001"] = FetchFailed("HTTP Error 503")
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, mailer=mailer)
+
+    assert mailer.sent == []
+
+
+@pytest.mark.parametrize(
+    "settings", [replace(EMAIL, enabled=False), replace(EMAIL, new_videos=False)]
+)
+def test_no_notification_when_email_or_new_videos_are_switched_off(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    mailer: FakeMailer,
+    settings: EmailSettings,
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(settings)
+
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+
+    assert mailer.sent == []
+
+
+@pytest.mark.parametrize(
+    "before", [replace(EMAIL, enabled=False), replace(EMAIL, new_videos=False)]
+)
+def test_switching_notifications_on_does_not_report_videos_filed_before(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    mailer: FakeMailer,
+    before: EmailSettings,
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(before)
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "Back catalogue", START + timedelta(minutes=1))),
+    )
+
+    state.save_email_settings(EMAIL)
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000002", "Fresh", START + timedelta(minutes=31))),
+    )
+
+    [message] = mailer.sent
+    assert "vid00000001" not in body(message)
+    assert "vid00000002" in body(message)
+
+
+def test_saving_settings_that_keep_notifications_on_reports_everything_still_unreported(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    mailer.error = MailError("Connection refused")
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+
+    state.save_email_settings(replace(EMAIL, host="mail.example.net"))
+    mailer.error = None
+    clock.advance()
+    run_cycle(media_library, state, clock, feed=feed, mailer=mailer)
+
+    [message] = mailer.sent
+    assert "vid00000001" in body(message)
+
+
+def test_failed_notification_is_a_warning_and_the_next_delivered_one_covers_both_cycles(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    mailer: FakeMailer,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    mailer.error = MailError("[Errno 111] Connection refused")
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+    failed_at = clock.now
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000002", "Two", START + timedelta(minutes=31))),
+    )
+
+    assert mailer.sent == []
+    assert state.notification_failure() == NotificationFailure(
+        failed_at, "Email can't be sent: [Errno 111] Connection refused"
+    )
+    assert "Email can't be sent: [Errno 111] Connection refused" in caplog.text
+
+    mailer.error = None
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000003", "Three", START + timedelta(minutes=61))),
+    )
+
+    [message] = mailer.sent
+    assert message["Subject"] == "youtube-helper: 3 new videos"
+    assert body(message).startswith(
+        "Notifications were failing since 2026-10-16 12:30 UTC;"
+        " this one covers everything since then.\n"
+        "\n"
+        "3 new videos were filed into the Media library.\n"
+    )
+    assert state.notification_failure() is None
+
+
+def test_notification_after_a_failure_says_when_it_failed_first_in_local_time(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    mailer.error = MailError("timed out")
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1)))
+    berlin = ZoneInfo("Europe/Berlin")
+    clock.advance()
+    run_cycle(media_library, state, clock, feed=feed, mailer=mailer, timezone=berlin)
+
+    mailer.error = None
+    clock.advance()
+    run_cycle(media_library, state, clock, feed=feed, mailer=mailer, timezone=berlin)
+
+    assert body(mailer.sent[0]).startswith(
+        "Notifications were failing since 2026-10-16 14:30 CEST;"
+    )
+
+
+def test_undecryptable_password_is_a_warning_and_nothing_is_sent(
+    media_library: Path, state_dir: Path, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    with closing(StateStore.open(state_dir, secret_key=b"the old secret")) as state:
+        subscribe(state, clock, FIRST)
+        state.save_email_settings(
+            replace(EMAIL, security=Security.STARTTLS, port=587, username="owner"),
+            password="hunter2",
+        )
+
+    with closing(StateStore.open(state_dir, secret_key=b"a rotated secret")) as state:
+        file_videos(
+            media_library,
+            state,
+            clock,
+            feed,
+            mailer,
+            ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+        )
+
+        failure = state.notification_failure()
+
+    assert mailer.sent == []
+    assert failure is not None
+    assert failure.warning == (
+        "SMTP password can't be decrypted with the current secret key; enter it again"
+    )
+
+
+def test_failing_notification_does_not_break_the_cycle(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    mailer.error = MailError("timed out")
+
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.downloaded == 1
+    assert len(videos(media_library)) == 1
+
+
+def test_notification_warning_clears_once_notifications_are_switched_off(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    mailer.error = MailError("timed out")
+    file_videos(
+        media_library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+
+    state.save_email_settings(replace(EMAIL, enabled=False))
+    clock.advance()
+    run_cycle(media_library, state, clock, feed=feed, mailer=mailer)
+
+    assert state.notification_failure() is None
+
+
+def test_unreported_videos_are_still_reported_after_a_restart(
+    media_library: Path, state_dir: Path, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    with closing(StateStore.open(state_dir)) as state:
+        subscribe(state, clock, FIRST)
+        state.save_email_settings(EMAIL)
+        mailer.error = MailError("timed out")
+        file_videos(
+            media_library,
+            state,
+            clock,
+            feed,
+            mailer,
+            ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+        )
+
+    mailer.error = None
+    with closing(StateStore.open(state_dir)) as state:
+        clock.advance()
+        run_cycle(media_library, state, clock, feed=feed, mailer=mailer)
+
+    [message] = mailer.sent
+    assert "vid00000001" in body(message)
+    assert body(message).startswith("Notifications were failing since")
+
+
+def test_skipped_cycle_still_sends_what_is_unreported(
+    tmp_path: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(EMAIL)
+    mailer.error = MailError("timed out")
+    file_videos(
+        library,
+        state,
+        clock,
+        feed,
+        mailer,
+        ("UC1", Upload("vid00000001", "One", START + timedelta(minutes=1))),
+    )
+    library.rename(tmp_path / "moved")
+
+    mailer.error = None
+    clock.advance()
+    run_cycle(library, state, clock, feed=feed, mailer=mailer)
+
+    [message] = mailer.sent
+    assert "vid00000001" in body(message)

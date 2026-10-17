@@ -22,7 +22,10 @@ SPDX-License-Identifier: GPL-2.0-only
 {% if outcome.low_space %}
 <p class="notice error" role="alert">Only {{ outcome.low_space.free | size }} free in the Media library, less than {{ outcome.low_space.threshold | size }}: downloads are paused, New uploads stay pending until there is more room.</p>
 {% endif %}
-{% if not (outcome.unwritable or failed or outcome.low_space) %}
+{% if notification_failure %}
+<p class="notice error" role="alert">{{ notification_failure.warning }} (since {{ notification_failure.since | local_time }}); the next Notification delivered reports everything since then.</p>
+{% endif %}
+{% if not (outcome.unwritable or failed or outcome.low_space or notification_failure) %}
 <p class="notice">Nothing needs your attention.</p>
 {% endif %}
 {% endif %}
