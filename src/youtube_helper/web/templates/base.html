@@ -1,0 +1,36 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>{% block title %}{% endblock %}youtube-helper</title>
+    <link rel="stylesheet" href="/static/pico.min.css">
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="/static/htmx.min.js" defer></script>
+  </head>
+  <body>
+    <header class="container">
+      <hgroup>
+        <h1>youtube-helper</h1>
+        <p>Keeps the Media library stocked with New uploads from your Subscriptions.</p>
+      </hgroup>
+      <nav>
+        <ul>
+          {% for href, label in [("/", "Subscriptions"), ("/notifications", "Notifications")] %}
+          <li><a href="{{ href }}"{% if request.url.path == href %} aria-current="page"{% endif %}>{{ label }}</a></li>
+          {% endfor %}
+        </ul>
+      </nav>
+    </header>
+    <main class="container">
+{% block main %}{% endblock %}
+    </main>
+  </body>
+</html>

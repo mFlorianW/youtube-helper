@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 import logging
+import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -31,16 +32,19 @@ class FakeSleep:
 
 
 class FakeServe:
-    """Records the port and front page of the web UI served, instead of listening on the port."""
+    """Records the port and pages of the web UI served, instead of listening on the port."""
 
     def __init__(self, error: OSError | None = None) -> None:
         self.error = error
         self.served: list[tuple[int, str]] = []
+        self.notifications: list[str] = []
 
     def __call__(self, app: Starlette, port: int) -> None:
         if self.error is not None:
             raise self.error
-        self.served.append((port, TestClient(app).get("/").text))
+        client = TestClient(app)
+        self.served.append((port, client.get("/").text))
+        self.notifications.append(client.get("/notifications").text)
 
 
 @pytest.fixture(autouse=True)
@@ -188,3 +192,60 @@ def test_daemon_exits_non_zero_when_the_web_port_is_taken(
     assert status != 0
     assert "Can't serve the web UI on port 8080: [Errno 98] Address already in use" in caplog.text
     assert "Cycle started" not in caplog.text
+
+
+def password_field(page: str) -> str:
+    match = re.search(r'<input[^>]*name="password"[^>]*>', page)
+    assert match is not None
+    return match[0]
+
+
+def test_daemon_with_a_secret_key_file_can_store_the_smtp_password(
+    media_library: Path, state_dir: Path, tmp_path: Path, serve: FakeServe
+) -> None:
+    secret = tmp_path / "secret_key"
+    secret.write_text("a long random secret\n")
+    env = environment(media_library, state_dir) | {"SECRET_KEY_FILE": str(secret)}
+
+    with pytest.raises(StopDaemon):
+        run_daemon(env, sleep=FakeSleep(stop_after=1))
+
+    [page] = serve.notifications
+    assert "disabled" not in password_field(page)
+    assert "SECRET_KEY_FILE" not in page
+
+
+def test_daemon_without_a_secret_key_file_starts_without_password_storage(
+    media_library: Path, state_dir: Path, serve: FakeServe
+) -> None:
+    with pytest.raises(StopDaemon):
+        run_daemon(environment(media_library, state_dir), sleep=FakeSleep(stop_after=1))
+
+    [page] = serve.notifications
+    assert "disabled" in password_field(page)
+    assert "SECRET_KEY_FILE" in page
+
+
+def test_daemon_exits_non_zero_with_an_unreadable_secret_key_file(
+    media_library: Path, state_dir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    missing = tmp_path / "missing-secret"
+    env = environment(media_library, state_dir) | {"SECRET_KEY_FILE": str(missing)}
+
+    status = run_daemon(env, sleep=FakeSleep(stop_after=1))
+
+    assert status != 0
+    assert f"SECRET_KEY_FILE {missing} can't be read: No such file or directory" in caplog.text
+
+
+def test_daemon_exits_non_zero_with_an_empty_secret_key_file(
+    media_library: Path, state_dir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    empty = tmp_path / "empty-secret"
+    empty.write_text("\n")
+    env = environment(media_library, state_dir) | {"SECRET_KEY_FILE": str(empty)}
+
+    status = run_daemon(env, sleep=FakeSleep(stop_after=1))
+
+    assert status != 0
+    assert f"SECRET_KEY_FILE {empty} is empty" in caplog.text

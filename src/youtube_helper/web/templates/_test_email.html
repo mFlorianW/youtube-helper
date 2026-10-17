@@ -1,0 +1,11 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+{% if test_error %}
+<p class="notice error" role="alert">{{ test_error }}</p>
+{% elif test_sent %}
+<p class="notice success">{{ test_sent }}</p>
+{% endif %}

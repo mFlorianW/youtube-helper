@@ -17,6 +17,7 @@ from youtube_helper.artwork import HttpArtwork
 from youtube_helper.channels import YtDlpResolver
 from youtube_helper.config import ConfigError, load_config
 from youtube_helper.cycle import Cycle
+from youtube_helper.notifications import SmtpMailer
 from youtube_helper.state import StateStore, StateUnavailable
 from youtube_helper.upload_feed import YouTubeFeed
 from youtube_helper.video_fetcher import YtDlpFetcher
@@ -50,13 +51,16 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
             config.state_dir,
             config.timezone,
         )
+        if config.secret_key is None:
+            log.info("SECRET_KEY_FILE is not set: no SMTP password can be stored")
         resolver = YtDlpResolver()
         with (
-            closing(StateStore.open(config.state_dir)) as state,
+            closing(StateStore.open(config.state_dir, secret_key=config.secret_key)) as state,
             httpx.Client(timeout=HTTP_TIMEOUT) as http,
         ):
             try:
-                serve(create_app(state, resolver, timezone=config.timezone), config.web_port)
+                app = create_app(state, resolver, timezone=config.timezone, mailer=SmtpMailer())
+                serve(app, config.web_port)
             except OSError as error:
                 raise WebUnavailable(config.web_port, error) from error
             cycle = Cycle(

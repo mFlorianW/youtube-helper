@@ -4,15 +4,20 @@
 
 import logging
 import re
+from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 from html import unescape
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 from starlette.testclient import TestClient
 
 from youtube_helper.channels import Channel, ChannelUnavailable, NotAChannel
+from youtube_helper.notifications import EmailSettings, MailError
 from youtube_helper.state import (
     AllDownloadsFailed,
     CycleOutcome,
@@ -69,9 +74,40 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
+class FakeMailer:
+    """Records the emails sent, or fails with the error set on it."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[EmailSettings, str | None, EmailMessage]] = []
+        self.error: MailError | None = None
+
+    def send(self, settings: EmailSettings, password: str | None, message: EmailMessage) -> None:
+        if self.error is not None:
+            raise self.error
+        self.sent.append((settings, password, message))
+
+
+SECRET = b"the deployment's secret"
+
+
 @pytest.fixture
-def client(state: StateStore, resolver: FakeResolver, clock: FakeClock) -> TestClient:
-    app = create_app(state, resolver, timezone=ZoneInfo("Europe/Berlin"), clock=clock)
+def state(state_dir: Path) -> Iterator[StateStore]:
+    with closing(StateStore.open(state_dir, secret_key=SECRET)) as store:
+        yield store
+
+
+@pytest.fixture
+def mailer() -> FakeMailer:
+    return FakeMailer()
+
+
+@pytest.fixture
+def client(
+    state: StateStore, resolver: FakeResolver, clock: FakeClock, mailer: FakeMailer
+) -> TestClient:
+    app = create_app(
+        state, resolver, timezone=ZoneInfo("Europe/Berlin"), clock=clock, mailer=mailer
+    )
     return TestClient(app)
 
 
@@ -420,3 +456,282 @@ def test_subscription_whose_feed_could_not_be_read_says_so(
         "Couldn't read the channel's feed in the last cycle (HTTP 500); trying again next cycle"
         in subscription_on(html, "Second Channel")
     )
+
+
+def notifications_page(client: TestClient) -> str:
+    response = client.get("/notifications")
+    assert response.status_code == 200
+    return unescape(response.text)
+
+
+def field(html: str, name: str) -> str:
+    """The <input>, <select> or <textarea> tag (with a textarea's text) for the field `name`."""
+    match = re.search(rf'<(input|select|textarea)\b[^>]*\bname="{name}"[^>]*>', html)
+    assert match is not None, f"no field {name}"
+    if match[1] == "textarea":
+        return html[match.start() : html.index("</textarea>", match.end())]
+    if match[1] == "select":
+        return html[match.start() : html.index("</select>", match.end())]
+    return match[0]
+
+
+def selected(html: str, name: str) -> str:
+    """The value of the option selected in the <select> called `name`."""
+    match = re.search(r'<option value="([^"]*)"[^>]*\bselected\b', field(html, name))
+    assert match is not None, f"nothing selected in {name}"
+    return match[1]
+
+
+def test_notifications_page_is_linked_from_the_header(client: TestClient) -> None:
+    assert 'href="/notifications"' in page(client)
+    assert 'href="/"' in notifications_page(client)
+
+
+def test_notifications_are_off_by_default_with_both_kinds_ticked(client: TestClient) -> None:
+    html = notifications_page(client)
+
+    assert "checked" not in field(html, "enabled")
+    assert "checked" in field(html, "new_videos")
+    assert "checked" in field(html, "warnings")
+    assert 'value="587"' in field(html, "port")
+    assert selected(html, "security") == "starttls"
+    assert "No password set" in html
+
+
+SETTINGS_FORM = {
+    "enabled": "on",
+    "warnings": "on",
+    "host": "smtp.example.org",
+    "port": "465",
+    "security": "tls",
+    "username": "owner",
+    "password": "hunter2-correct-horse",
+    "from_address": "youtube-helper@example.org",
+    "recipients": "owner@example.org\r\n partner@example.org \r\n",
+}
+
+
+def save_email(client: TestClient, **changes: str | None) -> str:
+    """Save the settings form with `changes`; a change to None leaves that field out."""
+    form = {name: value for name, value in (SETTINGS_FORM | changes).items() if value is not None}
+    response = client.post("/notifications", data=form)
+    assert response.status_code == 200
+    return unescape(response.text)
+
+
+def test_saved_settings_are_shown_without_the_password(
+    client: TestClient, state: StateStore
+) -> None:
+    html = save_email(client)
+
+    assert "Saved" in html
+    shown = notifications_page(client)
+    assert "checked" in field(shown, "enabled")
+    assert "checked" not in field(shown, "new_videos")
+    assert "checked" in field(shown, "warnings")
+    assert 'value="smtp.example.org"' in field(shown, "host")
+    assert 'value="465"' in field(shown, "port")
+    assert selected(shown, "security") == "tls"
+    assert 'value="owner"' in field(shown, "username")
+    assert "owner@example.org\npartner@example.org" in field(shown, "recipients")
+    assert "A password is set" in shown
+    assert "hunter2-correct-horse" not in html
+    assert "hunter2-correct-horse" not in shown
+    saved = state.email_settings()
+    assert saved.settings.recipients == ("owner@example.org", "partner@example.org")
+    assert saved.password == "hunter2-correct-horse"
+
+
+def test_saving_with_a_blank_password_keeps_the_stored_one(
+    client: TestClient, state: StateStore
+) -> None:
+    save_email(client)
+
+    save_email(client, password="", warnings=None)
+
+    assert not state.email_settings().settings.warnings
+    assert state.email_settings().password == "hunter2-correct-horse"
+
+
+def test_saving_with_htmx_sends_only_the_form(client: TestClient) -> None:
+    response = client.post("/notifications", data=SETTINGS_FORM, headers={"HX-Request": "true"})
+
+    assert "Saved" in response.text
+    assert "<html" not in response.text
+    assert 'id="email-settings"' in response.text
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        (
+            {"security": "none", "port": "25", "password": ""},
+            "Security “none” would send the username and password unencrypted",
+        ),
+        (
+            {"security": "none", "port": "25", "username": ""},
+            "Security “none” would send the username and password unencrypted",
+        ),
+        ({"from_address": "youtube-helper"}, "From address youtube-helper is not an email address"),
+        (
+            {"recipients": "owner@example.org\nowner at example.org"},
+            "Recipient owner at example.org is not an email address",
+        ),
+        ({"recipients": "a@example.org, b@example.org"}, "Recipient a@example.org, b@example.org"),
+        ({"port": "smtp"}, "Port smtp is not a port number (1-65535)"),
+        ({"port": "70000"}, "Port 70000 is not a port number (1-65535)"),
+        ({"security": "ssl"}, "Choose a security setting"),
+        ({"username": ""}, "A password is only used with a username"),
+        ({"host": ""}, "Email Notifications need an SMTP host, a From address and a recipient"),
+        (
+            {"recipients": ""},
+            "Email Notifications need an SMTP host, a From address and a recipient",
+        ),
+    ],
+)
+def test_invalid_settings_are_rejected_and_nothing_is_saved(
+    client: TestClient, state: StateStore, changes: dict[str, str], error: str
+) -> None:
+    html = save_email(client, **changes)
+
+    assert error in html
+    assert "Saved" not in html
+    assert "hunter2-correct-horse" not in html
+    assert state.email_settings().settings == EmailSettings()
+
+
+def test_rejected_settings_are_shown_as_entered_to_correct_them(client: TestClient) -> None:
+    html = save_email(client, port="smtp", recipients="owner@example.org\nnobody")
+
+    assert 'value="smtp"' in field(html, "port")
+    assert "owner@example.org\nnobody" in field(html, "recipients")
+    assert 'value="smtp.example.org"' in field(html, "host")
+
+
+def test_switched_off_notifications_may_be_saved_incomplete(
+    client: TestClient, state: StateStore
+) -> None:
+    save_email(client, enabled=None, host="", recipients="")
+
+    assert state.email_settings().settings.from_address == "youtube-helper@example.org"
+
+
+@pytest.mark.parametrize(("security", "port"), [("starttls", 587), ("tls", 465), ("none", 25)])
+def test_a_blank_port_is_the_security_settings_usual_one(
+    client: TestClient, state: StateStore, security: str, port: int
+) -> None:
+    save_email(client, security=security, port="", username="", password="")
+
+    assert state.email_settings().settings.port == port
+
+
+def app_on(state: StateStore, mailer: FakeMailer) -> TestClient:
+    return TestClient(
+        create_app(state, FakeResolver(), timezone=ZoneInfo("Europe/Berlin"), mailer=mailer)
+    )
+
+
+def test_a_password_the_current_key_cannot_decrypt_is_asked_for_again(
+    client: TestClient, state_dir: Path, mailer: FakeMailer
+) -> None:
+    save_email(client)
+
+    with closing(StateStore.open(state_dir, secret_key=b"a rotated secret")) as rotated:
+        html = notifications_page(app_on(rotated, mailer))
+
+    assert "The stored password can't be decrypted" in html
+    assert "please enter it again" in html
+    assert "disabled" not in field(html, "password")
+
+
+def test_without_a_secret_key_the_password_field_is_disabled_with_a_hint(
+    client: TestClient, state_dir: Path, mailer: FakeMailer
+) -> None:
+    with closing(StateStore.open(state_dir)) as keyless:
+        without_key = app_on(keyless, mailer)
+        html = notifications_page(without_key)
+        rejected = save_email(without_key)
+        saved = save_email(without_key, password=None)
+
+        assert "disabled" in field(html, "password")
+        assert "Set SECRET_KEY_FILE to store a password" in re.sub(r"<[^>]+>", "", html)
+        assert "SECRET_KEY_FILE" in rejected
+        assert "Saved" not in rejected
+        assert "Saved" in saved
+        assert keyless.email_settings().settings.host == "smtp.example.org"
+
+
+def send_test_email(client: TestClient) -> str:
+    response = client.post("/notifications/test", headers={"HX-Request": "true"})
+    assert response.status_code == 200
+    assert "<html" not in response.text
+    return unescape(response.text)
+
+
+def test_test_email_is_sent_right_away_with_the_saved_settings(
+    client: TestClient, state: StateStore, mailer: FakeMailer
+) -> None:
+    save_email(client, enabled=None)
+
+    html = send_test_email(client)
+
+    assert "Test email sent to owner@example.org, partner@example.org" in html
+    [(settings, password, message)] = mailer.sent
+    assert settings == state.email_settings().settings
+    assert password == "hunter2-correct-horse"
+    assert message["From"] == "youtube-helper@example.org"
+    assert message["To"] == "owner@example.org, partner@example.org"
+    assert "test" in message["Subject"].lower()
+
+
+def test_test_email_shows_the_smtp_error(client: TestClient, mailer: FakeMailer) -> None:
+    save_email(client)
+    mailer.error = MailError("(535, b'5.7.8 Authentication failed')")
+
+    html = send_test_email(client)
+
+    assert "Couldn't send the test email: (535, b'5.7.8 Authentication failed')" in html
+    assert "Test email sent" not in html
+
+
+def test_test_email_without_a_server_and_recipients_says_what_is_missing(
+    client: TestClient, mailer: FakeMailer
+) -> None:
+    html = send_test_email(client)
+
+    assert "Save an SMTP host, a From address and a recipient first" in html
+    assert mailer.sent == []
+
+
+def test_test_email_with_an_undecryptable_password_asks_for_it_again(
+    client: TestClient, state_dir: Path, mailer: FakeMailer
+) -> None:
+    save_email(client)
+
+    with closing(StateStore.open(state_dir, secret_key=b"a rotated secret")) as rotated:
+        html = send_test_email(app_on(rotated, mailer))
+
+    assert "The stored password can't be decrypted" in html
+    assert mailer.sent == []
+
+
+def test_test_email_without_htmx_shows_the_whole_page(client: TestClient) -> None:
+    save_email(client)
+
+    response = client.post("/notifications/test")
+
+    assert "<html" in response.text
+    assert "Test email sent" in response.text
+
+
+def test_test_email_after_the_secret_key_was_removed_asks_for_it(
+    client: TestClient, state_dir: Path, mailer: FakeMailer
+) -> None:
+    save_email(client)
+
+    with closing(StateStore.open(state_dir)) as keyless:
+        html = send_test_email(app_on(keyless, mailer))
+
+    assert "Set SECRET_KEY_FILE to use the stored password" in html
+    assert "enter it again" not in html
+    assert mailer.sent == []

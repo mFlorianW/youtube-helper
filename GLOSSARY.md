@@ -25,3 +25,11 @@ _Avoid_: Download folder, output dir, Jellyfin folder
 **Channel folder**:
 The folder inside the Media library that holds one Subscription's videos. Its name is taken from the channel's display name when the Subscription is first seen and never changes afterwards, even if the channel is renamed.
 _Avoid_: Show folder, series folder
+
+**Warning**:
+A problem a Cycle finds that needs the owner's attention: all downloads failing, low free space, an unwritable Media library, a video given up on or skipped, or a Subscription's feed unreadable for a day. It lasts until a later Cycle no longer finds it.
+_Avoid_: Problem, download problem, error, alert
+
+**Notification**:
+An email to the owner reporting what changed since the last Notification that was delivered: videos filed into the Media library, and Warnings raised or cleared.
+_Avoid_: Alert, report, digest, mail

@@ -8,7 +8,8 @@
 # the values marked "adjust". All configuration lives here; there is no separate config file.
 #
 # Before the first start, create the host directories for the Media library and the state,
-# writable by the user below (the tool never changes ownership or permissions).
+# writable by the user below (the tool never changes ownership or permissions), and the
+# secret for the SMTP password (see `secrets:` at the bottom).
 # After the first start, open the web UI (see `ports:`) and add the channels to follow.
 
 name: youtube-helper
@@ -34,6 +35,12 @@ services:
       # The port of the web UI inside the container (must match `ports:`). 8080 is the
       # default, so this line is optional.
       WEB_PORT: "8080"
+      # The secret the SMTP password for email Notifications is encrypted with in the state
+      # database (see `secrets:` below). Optional: without it, email works only with servers
+      # that need no login. Set but unreadable, it stops the daemon.
+      SECRET_KEY_FILE: /run/secrets/secret_key
+    secrets:
+      - secret_key
     # adjust: the host port of the web UI, e.g. http://<host>:8080. It has no login of its
     # own: keep it inside your LAN, or put a reverse proxy with authentication in front.
     ports:
@@ -52,3 +59,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+secrets:
+  secret_key:
+    # adjust: host path of the secret. Create it once and keep it; with a new one, the SMTP
+    # password has to be entered again in the web UI. Readable only by the user above:
+    #   openssl rand -base64 32 > /srv/youtube-helper/secret_key
+    #   chown 1000:1000 /srv/youtube-helper/secret_key && chmod 400 /srv/youtube-helper/secret_key
+    file: /srv/youtube-helper/secret_key

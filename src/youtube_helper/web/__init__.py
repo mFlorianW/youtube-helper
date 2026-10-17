@@ -2,8 +2,9 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-"""The web UI: the owner's Subscriptions, listed, added and removed in the browser, and the
-status of the last cycle with whatever needs the owner's attention."""
+"""The web UI: the owner's Subscriptions, listed, added and removed in the browser, the
+status of the last cycle with whatever needs the owner's attention, and the email Notification
+settings."""
 
 import logging
 import socket
@@ -11,6 +12,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,6 +27,15 @@ from starlette.templating import Jinja2Templates
 
 from youtube_helper.channels import Channel, ChannelResolver, ChannelUnavailable, NotAChannel
 from youtube_helper.cycle import BOT_CHECK_ADVICE, RETRY_PERIOD, format_size
+from youtube_helper.notifications import (
+    UNREADABLE_PASSWORD,
+    EmailSettings,
+    Mailer,
+    MailError,
+    Security,
+    read_email_form,
+    send_test_email,
+)
 from youtube_helper.state import StateStore, Subscribed, TrackedSubscription
 
 log = logging.getLogger(__name__)
@@ -40,6 +51,7 @@ def create_app(
     resolver: ChannelResolver,
     *,
     timezone: ZoneInfo,
+    mailer: Mailer,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> Starlette:
     templates = Jinja2Templates(directory=HERE / "templates")
@@ -49,6 +61,7 @@ def create_app(
     templates.env.filters["size"] = format_size
     templates.env.globals["bot_check_advice"] = BOT_CHECK_ADVICE
     templates.env.globals["retry_hours"] = RETRY_PERIOD // timedelta(hours=1)
+    templates.env.globals["unreadable_password"] = UNREADABLE_PASSWORD
     previews: OrderedDict[str, Channel] = OrderedDict()
 
     # The state store blocks while a cycle uses it, so it is only ever called off the event loop.
@@ -143,9 +156,74 @@ def create_app(
             )
         return await back_to_the_page(request)
 
+    async def render_notifications(
+        request: Request, template: str, *, form: dict[str, object] | None = None, **context: object
+    ) -> Response:
+        saved = await run_in_threadpool(state.email_settings)
+        return templates.TemplateResponse(
+            request,
+            template,
+            {
+                "form": form or _form_values(saved.settings),
+                "password_state": saved.password_state.value,
+                "can_store_password": state.can_store_password,
+                "securities": SECURITIES,
+                **context,
+            },
+        )
+
+    async def notifications(request: Request) -> Response:
+        return await render_notifications(
+            request, "notifications.html", saved="saved" in request.query_params
+        )
+
+    async def save_notifications(request: Request) -> Response:
+        submitted = {name: str(value) for name, value in (await request.form()).items()}
+        entered = read_email_form(submitted, can_store_password=state.can_store_password)
+        if not entered.errors:
+            await run_in_threadpool(state.save_email_settings, entered.settings, entered.password)
+            log.info("Saved the email Notification settings")
+            if not is_htmx(request):
+                return RedirectResponse("/notifications?saved", status_code=303)
+            return await render_notifications(request, "_email_settings.html", saved=True)
+        # What was entered, to correct it; but never the password.
+        form = _form_values(entered.settings) | {
+            name: submitted.get(name, "") for name in ("port", "recipients")
+        }
+        return await render_notifications(
+            request,
+            "_email_settings.html" if is_htmx(request) else "notifications.html",
+            form=form,
+            errors=entered.errors,
+        )
+
+    async def test_email(request: Request) -> Response:
+        saved = await run_in_threadpool(state.email_settings)
+        sent = error = None
+        try:
+            sent = await run_in_threadpool(
+                partial(send_test_email, can_store_password=state.can_store_password),
+                saved,
+                mailer,
+            )
+        except MailError as failure:
+            error = f"Couldn't send the test email: {failure}"
+        else:
+            log.info("%s", sent)
+        if is_htmx(request):
+            return templates.TemplateResponse(
+                request, "_test_email.html", {"test_sent": sent, "test_error": error}
+            )
+        return await render_notifications(
+            request, "notifications.html", test_sent=sent, test_error=error
+        )
+
     return Starlette(
         routes=[
             Route("/", index),
+            Route("/notifications", notifications),
+            Route("/notifications", save_notifications, methods=["POST"]),
+            Route("/notifications/test", test_email, methods=["POST"]),
             Route("/status", status),
             Route("/preview", preview, methods=["POST"]),
             Route("/subscriptions", add, methods=["POST"]),
@@ -153,6 +231,31 @@ def create_app(
             Mount("/static", StaticFiles(directory=HERE / "static"), name="static"),
         ]
     )
+
+
+SECURITIES = [
+    (security.value, label, security.default_port)
+    for security, label in [
+        (Security.STARTTLS, "STARTTLS"),
+        (Security.TLS, "Implicit TLS"),
+        (Security.NONE, "None (unencrypted)"),
+    ]
+]
+
+
+def _form_values(settings: EmailSettings) -> dict[str, object]:
+    """The settings as the form on the notifications page shows them."""
+    return {
+        "enabled": settings.enabled,
+        "new_videos": settings.new_videos,
+        "warnings": settings.warnings,
+        "host": settings.host,
+        "port": str(settings.port),
+        "security": settings.security.value,
+        "username": settings.username,
+        "from_address": settings.from_address,
+        "recipients": "\n".join(settings.recipients),
+    }
 
 
 def serve(app: Starlette, port: int) -> None:

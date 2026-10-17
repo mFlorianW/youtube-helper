@@ -6,7 +6,9 @@
 # anyway. Without Swarm, use compose.yaml next to this file; settings not explained here are
 # explained there.
 #
-# Deploy and follow the logs:
+# Create the secret for the SMTP password once (see `secrets:` at the bottom), then deploy
+# and follow the logs:
+#   openssl rand -base64 32 | docker secret create youtube-helper_secret_key -
 #   docker stack deploy -c stack.yaml youtube-helper
 #   docker service logs -f youtube-helper_youtube-helper
 # Then open the web UI (see `ports:`) and add the channels to follow.
@@ -20,6 +22,15 @@ services:
       MEDIA_LIBRARY: /media-library
       # adjust: your local time zone (IANA name).
       TZ: Europe/Berlin
+      # The secret the SMTP password for email Notifications is encrypted with.
+      SECRET_KEY_FILE: /run/secrets/secret_key
+    secrets:
+      # Mounted readable only by the service's user (adjust uid and gid along with `user:`).
+      - source: secret_key
+        target: secret_key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
     # adjust: the host port of the web UI. It has no login of its own: keep it inside your
     # LAN, or put a reverse proxy with authentication in front.
     ports:
@@ -50,3 +61,10 @@ services:
       placement:
         constraints:
           - node.role == manager
+
+secrets:
+  secret_key:
+    # Created beforehand with `docker secret create` (see the header). Keep it: with a new one,
+    # the SMTP password has to be entered again in the web UI.
+    external: true
+    name: youtube-helper_secret_key
