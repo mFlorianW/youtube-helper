@@ -11,19 +11,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from youtube_helper.account import (
-    Account,
-    AccountUnavailable,
-    LoginLapsed,
-    LoginMissing,
-    Subscription,
-)
 from youtube_helper.artwork import Artwork, ArtworkUnavailable
+from youtube_helper.channels import ChannelResolver, ChannelUnavailable, NotAChannel
 from youtube_helper.media_library import (
     NFO_SUFFIX,
     POSTER,
     TVSHOW_NFO,
-    channel_folder,
     ensure_writable,
     file_atomically,
     file_video,
@@ -52,6 +45,9 @@ MIN_FREE_SPACE = 10 * GIB
 # How long a video may keep failing before the Cycle gives up on it.
 RETRY_PERIOD = timedelta(hours=24)
 
+# How often a Subscription's description and avatar are looked up again.
+DETAILS_REFRESH_PERIOD = timedelta(days=1)
+
 BOT_CHECK_ADVICE = "If this keeps happening, a PO-token provider is needed"
 
 
@@ -61,7 +57,7 @@ class Cycle:
         media_library: Path,
         state: StateStore,
         *,
-        account: Account,
+        resolver: ChannelResolver,
         feed: UploadFeed,
         fetcher: VideoFetcher,
         artwork: Artwork,
@@ -71,7 +67,7 @@ class Cycle:
     ) -> None:
         self._media_library = media_library
         self._state = state
-        self._account = account
+        self._resolver = resolver
         self._feed = feed
         self._fetcher = fetcher
         self._artwork = artwork
@@ -86,7 +82,7 @@ class Cycle:
         """
         ensure_writable(self._media_library)
         log.info("Cycle started")
-        subscriptions = self._active_subscriptions()
+        subscriptions = [self._refresh_details(s) for s in self._active_subscriptions()]
         for subscription in subscriptions:
             self._detect_new_uploads(subscription)
         downloads = _Downloads()
@@ -239,19 +235,11 @@ class Cycle:
                 )
 
     def _active_subscriptions(self) -> list[TrackedSubscription]:
-        """The Subscriptions to follow this cycle, synced with the account when it can be read."""
-        try:
-            current = self._account.subscriptions()
-        except LoginMissing:
-            log.warning("Not logged in, run `login`")
-            return []
-        except LoginLapsed:
-            log.warning("Login has lapsed, run `login` again; using the last known Subscriptions")
-        except AccountUnavailable as error:
-            log.warning("Can't read the Subscriptions (%s); the last known ones are used", error)
-        else:
-            self._sync(current)
+        """The Subscriptions to follow this cycle."""
         active = [s for s in self._state.tracked_subscriptions() if s.active]
+        if not active:
+            log.info("No active Subscriptions; add channels in the web UI")
+            return []
         log.info(
             "Active Subscriptions (%d): %s",
             len(active),
@@ -259,57 +247,31 @@ class Cycle:
         )
         return active
 
-    def _sync(self, current: list[Subscription]) -> None:
-        """Start, restart or stop tracking so the tracked Subscriptions match `current`."""
+    def _refresh_details(self, subscription: TrackedSubscription) -> TrackedSubscription:
+        """The Subscription with its description and avatar looked up again once they are due.
+
+        The display name stays the one from first sight, like the Channel folder.
+        """
         now = self._clock()
-        known = {s.channel_id: s for s in self._state.tracked_subscriptions()}
-        changed = []
-        for subscription in current:
-            tracked = known.get(subscription.channel_id)
-            if tracked is None:
-                tracked = TrackedSubscription(
-                    channel_id=subscription.channel_id,
-                    display_name=subscription.display_name,
-                    channel_folder=channel_folder(
-                        subscription.display_name, subscription.channel_id
-                    ),
-                    active=True,
-                    tracking_start=now,
-                    description=subscription.description,
-                    avatar_url=subscription.avatar_url,
-                )
-                action = "Started"
-            elif not tracked.active:
-                tracked = replace(tracked, active=True, tracking_start=now)
-                action = "Restarted"
-            else:
-                action = None
-            # Keep the name from first sight: the Channel folder never follows a rename.
-            # The description and avatar do follow the channel.
-            refreshed = replace(
-                tracked, description=subscription.description, avatar_url=subscription.avatar_url
+        refreshed = subscription.details_refreshed
+        if refreshed is not None and now - refreshed < DETAILS_REFRESH_PERIOD:
+            return subscription
+        try:
+            channel = self._resolver.resolve(subscription.channel_id)
+        except (ChannelUnavailable, NotAChannel) as error:
+            log.warning(
+                "Can't refresh the details of %s (%s); trying again next cycle",
+                subscription.display_name,
+                error,
             )
-            if refreshed != known.get(subscription.channel_id):
-                changed.append(refreshed)
-            if action is None:
-                continue
-            log.info(
-                "%s tracking %s (%s) from %s",
-                action,
-                tracked.display_name,
-                tracked.channel_id,
-                _format_time(now),
-            )
-        current_ids = {s.channel_id for s in current}
-        for tracked in known.values():
-            if tracked.active and tracked.channel_id not in current_ids:
-                changed.append(replace(tracked, active=False))
-                log.info(
-                    "Stopped tracking %s (%s): unsubscribed; its files are kept",
-                    tracked.display_name,
-                    tracked.channel_id,
-                )
-        self._state.save_tracked_subscriptions(changed)
+            return subscription
+        self._state.refresh_details(channel, now)
+        return replace(
+            subscription,
+            description=channel.description,
+            avatar_url=channel.avatar_url,
+            details_refreshed=now,
+        )
 
 
 @dataclass(frozen=True)

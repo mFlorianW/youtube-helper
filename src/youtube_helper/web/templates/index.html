@@ -1,0 +1,43 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>youtube-helper</title>
+    <link rel="stylesheet" href="/static/pico.min.css">
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="/static/htmx.min.js" defer></script>
+  </head>
+  <body>
+    <header class="container">
+      <hgroup>
+        <h1>youtube-helper</h1>
+        <p>Keeps the Media library stocked with New uploads from your Subscriptions.</p>
+      </hgroup>
+    </header>
+    <main class="container">
+      <article>
+        <header><h2>Add a channel</h2></header>
+        <form method="post" action="/preview"
+              hx-post="/preview" hx-target="#preview" hx-indicator="#look-up"
+              hx-disabled-elt="find button">
+          <fieldset role="group">
+            <input name="channel" value="{{ reference or '' }}" required autocomplete="off"
+                   aria-label="Channel" placeholder="@handle, channel URL or video URL">
+            <button id="look-up" type="submit">Look up</button>
+          </fieldset>
+          <small>Only videos the channel publishes after you add it are downloaded.</small>
+        </form>
+        <div id="preview" aria-live="polite">{% include "_preview.html" %}</div>
+      </article>
+      <section id="subscriptions">{% include "_subscriptions.html" %}</section>
+    </main>
+  </body>
+</html>

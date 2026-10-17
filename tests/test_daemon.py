@@ -7,6 +7,8 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from starlette.applications import Starlette
+from starlette.testclient import TestClient
 
 from youtube_helper.daemon import run_daemon
 
@@ -26,6 +28,26 @@ class FakeSleep:
         self.durations.append(timedelta(seconds=seconds))
         if len(self.durations) >= self.stop_after:
             raise StopDaemon
+
+
+class FakeServe:
+    """Records the port and front page of the web UI served, instead of listening on the port."""
+
+    def __init__(self, error: OSError | None = None) -> None:
+        self.error = error
+        self.served: list[tuple[int, str]] = []
+
+    def __call__(self, app: Starlette, port: int) -> None:
+        if self.error is not None:
+            raise self.error
+        self.served.append((port, TestClient(app).get("/").text))
+
+
+@pytest.fixture(autouse=True)
+def serve(monkeypatch: pytest.MonkeyPatch) -> FakeServe:
+    serve = FakeServe()
+    monkeypatch.setattr("youtube_helper.daemon.serve", serve)
+    return serve
 
 
 def environment(media_library: Path, state_dir: Path) -> dict[str, str]:
@@ -103,12 +125,47 @@ def test_daemon_exits_non_zero_naming_an_unusable_state_directory(
     assert str(missing) in caplog.text
 
 
-def test_daemon_asks_for_login_every_cycle_while_not_logged_in(
-    media_library: Path, state_dir: Path, caplog: pytest.LogCaptureFixture
+def test_daemon_serves_the_web_ui_on_port_8080_by_default(
+    media_library: Path, state_dir: Path, serve: FakeServe
 ) -> None:
-    sleep = FakeSleep(stop_after=2)
+    with pytest.raises(StopDaemon):
+        run_daemon(environment(media_library, state_dir), sleep=FakeSleep(stop_after=1))
+
+    [(port, page)] = serve.served
+    assert port == 8080
+    assert "No Subscriptions yet" in page
+
+
+def test_daemon_serves_the_web_ui_on_the_configured_port(
+    media_library: Path, state_dir: Path, serve: FakeServe
+) -> None:
+    env = environment(media_library, state_dir) | {"WEB_PORT": "9000"}
 
     with pytest.raises(StopDaemon):
-        run_daemon(environment(media_library, state_dir), sleep=sleep)
+        run_daemon(env, sleep=FakeSleep(stop_after=1))
 
-    assert caplog.text.count("Not logged in, run `login`") == 2
+    assert [port for port, _ in serve.served] == [9000]
+
+
+@pytest.mark.parametrize("port", ["http", "0", "65536"])
+def test_daemon_exits_non_zero_with_an_invalid_web_port(
+    media_library: Path, state_dir: Path, caplog: pytest.LogCaptureFixture, port: str
+) -> None:
+    env = environment(media_library, state_dir) | {"WEB_PORT": port}
+
+    status = run_daemon(env, sleep=FakeSleep(stop_after=1))
+
+    assert status != 0
+    assert f"WEB_PORT {port!r} is not a port number (1-65535)" in caplog.text
+
+
+def test_daemon_exits_non_zero_when_the_web_port_is_taken(
+    media_library: Path, state_dir: Path, serve: FakeServe, caplog: pytest.LogCaptureFixture
+) -> None:
+    serve.error = OSError(98, "Address already in use")
+
+    status = run_daemon(environment(media_library, state_dir), sleep=FakeSleep(stop_after=1))
+
+    assert status != 0
+    assert "Can't serve the web UI on port 8080: [Errno 98] Address already in use" in caplog.text
+    assert "Cycle started" not in caplog.text

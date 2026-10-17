@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-"""Command line entry point: the daemon by default, or a one-off command such as `login`."""
+"""Command line entry point: runs the daemon."""
 
 import argparse
 import logging
@@ -14,7 +14,6 @@ from types import FrameType
 from typing import NoReturn
 
 from youtube_helper.daemon import run_daemon
-from youtube_helper.login import run_login
 
 log = logging.getLogger(__name__)
 
@@ -27,11 +26,9 @@ def _stop(signum: int, frame: FrameType | None) -> NoReturn:
 def main(argv: Sequence[str] | None = None) -> NoReturn:
     parser = argparse.ArgumentParser(
         prog="youtube-helper",
-        description="Without a command, run the daemon.",
+        description="Run the daemon: the cycles and the web UI for managing the Subscriptions.",
     )
-    commands = parser.add_subparsers(dest="command", title="commands")
-    commands.add_parser("login", help="authorise access to the owner's YouTube account (once)")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
     logging.basicConfig(
         stream=sys.stdout,
@@ -40,8 +37,4 @@ def main(argv: Sequence[str] | None = None) -> NoReturn:
     )
     # As PID 1 in a container, SIGTERM is ignored unless handled explicitly.
     signal.signal(signal.SIGTERM, _stop)
-    match args.command:
-        case "login":
-            sys.exit(run_login(os.environ))
-        case _:
-            sys.exit(run_daemon(os.environ))
+    sys.exit(run_daemon(os.environ))

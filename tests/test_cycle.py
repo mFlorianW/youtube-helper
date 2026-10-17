@@ -5,6 +5,7 @@
 import logging
 import os
 import re
+import sqlite3
 import xml.etree.ElementTree as ET
 from contextlib import closing
 from dataclasses import replace
@@ -14,11 +15,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from youtube_helper.account import AccountUnavailable, LoginLapsed, LoginMissing, Subscription
 from youtube_helper.artwork import ArtworkUnavailable
+from youtube_helper.channels import Channel, ChannelUnavailable
 from youtube_helper.cycle import Cycle
 from youtube_helper.media_library import MediaLibraryUnwritable
-from youtube_helper.state import StateStore
+from youtube_helper.state import DATABASE_NAME, MIGRATIONS, StateStore
 from youtube_helper.upload_feed import FeedUnavailable, Upload
 from youtube_helper.video_fetcher import (
     BotCheck,
@@ -33,21 +34,24 @@ START = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 GIB = 1024**3
 UTC_ZONE = ZoneInfo("UTC")
 
-FIRST = Subscription("UC1", "First Channel", "https://yt3.ggpht.com/UC1", "About First")
-SECOND = Subscription("UC2", "Second Channel", "https://yt3.ggpht.com/UC2", "About Second")
-THIRD = Subscription("UC3", "Third Channel", None, "")
+FIRST = Channel("UC1", "First Channel", "https://yt3.ggpht.com/UC1", "About First")
+SECOND = Channel("UC2", "Second Channel", "https://yt3.ggpht.com/UC2", "About Second")
+THIRD = Channel("UC3", "Third Channel", None, "")
 
 
-class FakeAccount:
-    """Answers with the Subscriptions set on it, or raises the error set on it."""
+class FakeResolver:
+    """Resolves each channel set on it by its channel ID, or raises the error set for it."""
 
-    def __init__(self, *subscriptions: Subscription, error: Exception | None = None) -> None:
-        self.current: list[Subscription] | Exception = error or list(subscriptions)
+    def __init__(self, *channels: Channel) -> None:
+        self.channels: dict[str, Channel | Exception] = {c.channel_id: c for c in channels}
+        self.resolved: list[str] = []
 
-    def subscriptions(self) -> list[Subscription]:
-        if isinstance(self.current, Exception):
-            raise self.current
-        return list(self.current)
+    def resolve(self, reference: str) -> Channel:
+        self.resolved.append(reference)
+        channel = self.channels.get(reference, ChannelUnavailable(f"unknown {reference}"))
+        if isinstance(channel, Exception):
+            raise channel
+        return channel
 
 
 class FakeClock:
@@ -125,6 +129,12 @@ class FakeArtwork:
         return f"image {url}".encode()
 
 
+def subscribe(state: StateStore, clock: FakeClock | None, *channels: Channel) -> None:
+    """Subscribe to the channels, as the owner does in the web UI, at the clock's time."""
+    for channel in channels:
+        state.subscribe(channel, (clock or FakeClock())())
+
+
 def media_files(media_library: Path) -> list[Path]:
     """Every file a media server would see: hidden directories are ignored."""
     return sorted(
@@ -188,9 +198,9 @@ def info_logs(caplog: pytest.LogCaptureFixture) -> None:
 def run_cycle(
     media_library: Path,
     state: StateStore,
-    account: FakeAccount,
     clock: FakeClock | None = None,
     *,
+    resolver: FakeResolver | None = None,
     feed: FakeFeed | None = None,
     fetcher: FakeFetcher | None = None,
     artwork: FakeArtwork | None = None,
@@ -200,7 +210,7 @@ def run_cycle(
     Cycle(
         media_library,
         state,
-        account=account,
+        resolver=resolver or FakeResolver(FIRST, SECOND, THIRD),
         feed=feed or FakeFeed(),
         fetcher=fetcher or FakeFetcher(),
         artwork=artwork or FakeArtwork(),
@@ -213,7 +223,7 @@ def run_cycle(
 def test_cycle_with_writable_media_library_is_logged(
     media_library: Path, state: StateStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    run_cycle(media_library, state, FakeAccount())
+    run_cycle(media_library, state)
 
     assert "Cycle finished" in caplog.text
 
@@ -225,7 +235,7 @@ def test_cycle_with_read_only_media_library_fails_naming_the_directory(
     media_library.chmod(0o555)
     try:
         with pytest.raises(MediaLibraryUnwritable, match=re.escape(str(media_library))):
-            run_cycle(media_library, state, FakeAccount())
+            run_cycle(media_library, state)
     finally:
         media_library.chmod(0o755)
 
@@ -236,165 +246,224 @@ def test_cycle_with_missing_media_library_fails_naming_the_directory(
     missing = tmp_path / "missing"
 
     with pytest.raises(MediaLibraryUnwritable, match=re.escape(str(missing))):
-        run_cycle(missing, state, FakeAccount())
+        run_cycle(missing, state)
 
 
-def test_cycle_after_login_does_not_ask_for_login(
-    media_library: Path, state: StateStore, caplog: pytest.LogCaptureFixture
-) -> None:
-    run_cycle(media_library, state, FakeAccount(FIRST))
-
-    assert "Not logged in" not in caplog.text
-
-
-def test_first_start_tracks_every_subscription_from_now(
+def test_cycle_follows_the_active_subscriptions(
     media_library: Path, state: StateStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
 ) -> None:
-    run_cycle(media_library, state, FakeAccount(FIRST, SECOND), clock)
+    subscribe(state, clock, FIRST, SECOND)
 
-    assert "Started tracking First Channel (UC1) from 2026-10-16 12:00 UTC" in caplog.text
-    assert "Started tracking Second Channel (UC2) from 2026-10-16 12:00 UTC" in caplog.text
+    run_cycle(media_library, state, clock)
+
     assert "Active Subscriptions (2): First Channel, Second Channel" in caplog.text
 
 
-def test_new_subscription_is_tracked_from_when_it_is_first_seen(
-    media_library: Path, state_dir: Path, clock: FakeClock, caplog: pytest.LogCaptureFixture
+def test_cycle_without_subscriptions_says_where_to_add_them(
+    media_library: Path, state: StateStore, fetcher: FakeFetcher, caplog: pytest.LogCaptureFixture
 ) -> None:
-    account = FakeAccount(FIRST)
+    run_cycle(media_library, state, fetcher=fetcher)
+
+    assert "No active Subscriptions; add channels in the web UI" in caplog.text
+    assert fetcher.fetched == []
+
+
+def test_subscription_is_tracked_from_when_it_was_added(
+    media_library: Path, state_dir: Path, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
     with closing(StateStore.open(state_dir)) as state:
-        run_cycle(media_library, state, account, clock)
-    caplog.clear()
+        subscribe(state, clock, FIRST)
     clock.advance(timedelta(hours=2))
-    account.current = [FIRST, SECOND]
+    with closing(StateStore.open(state_dir)) as state:
+        subscribe(state, clock, SECOND)
+    feed.publish("UC1", Upload("vid00000001", "First, after", START + timedelta(hours=1)))
+    feed.publish("UC2", Upload("vid00000002", "Second, before", START + timedelta(hours=1)))
+    feed.publish("UC2", Upload("vid00000003", "Second, after", START + timedelta(hours=3)))
+    clock.advance(timedelta(hours=2))
 
     # A restart in between: a new process on the same state file.
     with closing(StateStore.open(state_dir)) as state:
-        run_cycle(media_library, state, account, clock)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
-    assert "Started tracking Second Channel (UC2) from 2026-10-16 14:00 UTC" in caplog.text
-    assert "First Channel (UC1) from" not in caplog.text
-    assert "Active Subscriptions (2): First Channel, Second Channel" in caplog.text
+    assert fetcher.fetched == ["vid00000001", "vid00000003"]
 
 
-def test_unsubscribed_channel_becomes_inactive_and_its_files_stay(
-    media_library: Path, state: StateStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
+def test_unsubscribed_channel_is_no_longer_followed_and_its_files_stay(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock)
+    subscribe(state, clock, FIRST, SECOND)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     downloaded = media_library / "First Channel" / "Season 2026" / "video.mkv"
     downloaded.parent.mkdir(parents=True)
     downloaded.write_bytes(b"video")
+    state.unsubscribe("UC1")
+    feed.publish("UC1", Upload("vid00000001", "After unsubscribing", START + timedelta(hours=1)))
+    clock.advance(timedelta(hours=2))
     caplog.clear()
-    clock.advance()
-    account.current = [SECOND]
 
-    run_cycle(media_library, state, account, clock)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
-    assert "Stopped tracking First Channel (UC1): unsubscribed" in caplog.text
     assert "Active Subscriptions (1): Second Channel" in caplog.text
+    assert fetcher.fetched == []
     assert downloaded.read_bytes() == b"video"
 
 
-def test_unsubscribed_channel_is_reported_only_once(
-    media_library: Path, state: StateStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
+def test_resubscribed_channel_restarts_tracking_and_the_gap_is_never_fetched(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock)
-    account.current = [SECOND]
-    run_cycle(media_library, state, account, clock)
-    caplog.clear()
-
-    run_cycle(media_library, state, account, clock)
-
-    assert "Stopped tracking" not in caplog.text
-    assert "Active Subscriptions (1): Second Channel" in caplog.text
-
-
-def test_resubscribed_channel_restarts_tracking_from_now(
-    media_library: Path, state: StateStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
-) -> None:
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock)
+    subscribe(state, clock, FIRST)
     clock.advance()
-    account.current = [SECOND]
-    run_cycle(media_library, state, account, clock)
-    caplog.clear()
+    state.unsubscribe("UC1")
+    feed.publish("UC1", Upload("vid00000001", "In the gap", START + timedelta(hours=1)))
     clock.advance(timedelta(days=3))
-    account.current = [FIRST, SECOND]
+    subscribe(state, clock, FIRST)
+    feed.publish("UC1", Upload("vid00000002", "After", clock.now + timedelta(minutes=10)))
+    clock.advance()
 
-    run_cycle(media_library, state, account, clock)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
-    assert "Restarted tracking First Channel (UC1) from 2026-10-19 12:30 UTC" in caplog.text
-    assert "Started tracking" not in caplog.text
-    assert "Active Subscriptions (2): First Channel, Second Channel" in caplog.text
+    assert fetcher.fetched == ["vid00000002"]
 
 
-def test_lapsed_login_keeps_the_last_known_subscriptions_and_says_so_every_cycle(
-    media_library: Path, state: StateStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
+def test_subscribing_again_to_an_active_subscription_changes_nothing(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock)
-    account.current = [SECOND]
-    run_cycle(media_library, state, account, clock)
-    caplog.clear()
-    account.current = LoginLapsed()
+    subscribe(state, clock, FIRST)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(hours=1)))
+    clock.advance(timedelta(hours=2))
 
-    run_cycle(media_library, state, account, clock)
-    run_cycle(media_library, state, account, clock)
+    subscribe(state, clock, replace(FIRST, display_name="Renamed Channel"))
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
-    assert caplog.text.count("Login has lapsed, run `login` again") == 2
-    assert caplog.text.count("Active Subscriptions (1): Second Channel") == 2
-    assert "Stopped tracking" not in caplog.text
-
-
-def test_unreadable_account_keeps_the_last_known_subscriptions(
-    media_library: Path, state: StateStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
-) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock)
-    caplog.clear()
-    account.current = AccountUnavailable("can't reach oauth2.googleapis.com: timed out")
-
-    run_cycle(media_library, state, account, clock)
-
-    assert (
-        "Can't read the Subscriptions (can't reach oauth2.googleapis.com: timed out)" in caplog.text
-    )
-    assert "Active Subscriptions (1): First Channel" in caplog.text
-    assert "Stopped tracking" not in caplog.text
-
-
-def test_missing_login_tracks_nothing(
-    media_library: Path, state: StateStore, caplog: pytest.LogCaptureFixture
-) -> None:
-    run_cycle(media_library, state, FakeAccount(error=LoginMissing()))
-
-    assert "Not logged in, run `login`" in caplog.text
-    assert "tracking" not in caplog.text
-    assert "Active Subscriptions" not in caplog.text
+    assert fetcher.fetched == ["vid00000001"]
+    assert videos(media_library)[0].parts[0] == "First Channel"
 
 
 def test_resubscribed_channel_keeps_the_name_it_was_first_seen_with(
-    media_library: Path, state: StateStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock)
-    account.current = []
-    run_cycle(media_library, state, account, clock)
-    caplog.clear()
-    account.current = [Subscription("UC1", "Renamed Channel", None, "")]
+    subscribe(state, clock, FIRST)
+    state.unsubscribe("UC1")
+    subscribe(state, clock, replace(FIRST, display_name="Renamed Channel"))
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance()
 
-    run_cycle(media_library, state, account, clock)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
-    assert "Restarted tracking First Channel (UC1)" in caplog.text
     assert "Active Subscriptions (1): First Channel" in caplog.text
+    assert videos(media_library)[0].parts[0] == "First Channel"
+
+
+def test_channel_details_are_refreshed_once_a_day(
+    media_library: Path, state: StateStore, clock: FakeClock
+) -> None:
+    resolver = FakeResolver(FIRST)
+    subscribe(state, clock, FIRST)
+    clock.advance()
+    run_cycle(media_library, state, clock, resolver=resolver)
+    assert resolver.resolved == []
+
+    clock.advance(timedelta(days=1))
+    run_cycle(media_library, state, clock, resolver=resolver)
+    clock.advance()
+    run_cycle(media_library, state, clock, resolver=resolver)
+
+    assert resolver.resolved == ["UC1"]
+
+
+def test_channel_details_that_cannot_be_refreshed_keep_their_last_known_values(
+    media_library: Path,
+    state: StateStore,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    resolver = FakeResolver()
+    resolver.channels["UC1"] = ChannelUnavailable("HTTP 503")
+    subscribe(state, clock, FIRST)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    clock.advance(timedelta(days=1))
+
+    run_cycle(media_library, state, clock, resolver=resolver, feed=feed, fetcher=fetcher)
+
+    assert "Can't refresh the details of First Channel (HTTP 503); trying again next cycle" in (
+        caplog.text
+    )
+    assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["plot"] == "About First"
+    resolver.channels["UC1"] = replace(FIRST, description="About First, revised")
+    clock.advance()
+
+    run_cycle(media_library, state, clock, resolver=resolver, feed=feed, fetcher=fetcher)
+
+    assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["plot"] == "About First, revised"
+
+
+# The last schema with the owner's Google login. Released migrations never change, so applying
+# them reproduces a state file that version left behind.
+GOOGLE_SCHEMA_VERSION = 10
+
+
+def test_subscriptions_from_the_google_login_carry_on_after_upgrading(
+    media_library: Path,
+    state_dir: Path,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with closing(sqlite3.connect(state_dir / DATABASE_NAME, autocommit=True)) as old:
+        for migration in MIGRATIONS[:GOOGLE_SCHEMA_VERSION]:
+            if isinstance(migration, str):
+                old.execute(migration)
+            else:
+                migration(old)
+        old.execute(f"PRAGMA user_version = {GOOGLE_SCHEMA_VERSION}")
+        old.execute("INSERT INTO login VALUES (1, 'refresh-token')")
+        old.execute(
+            "INSERT INTO subscription (channel_id, display_name, active, tracking_start,"
+            " channel_folder, description, avatar_url) VALUES"
+            " ('UC1', 'First Channel', 1, '2026-10-16T12:00:00+00:00', 'First Channel',"
+            " 'About First', 'https://yt3.ggpht.com/UC1'),"
+            " ('UC2', 'Second Channel', 0, '2026-10-16T12:00:00+00:00', 'Second Channel', '', NULL)"
+        )
+        old.execute(
+            "INSERT INTO video (video_id, channel_id, title, released, status) VALUES"
+            " ('vid00000001', 'UC1', 'Downloaded', '2026-10-16T12:05:00+00:00', 'downloaded'),"
+            " ('vid00000002', 'UC1', 'Pending', '2026-10-16T12:10:00+00:00', 'pending')"
+        )
+        old.execute("INSERT INTO season VALUES ('UC1', 2026, 7)")
+    feed.publish("UC1", Upload("vid00000001", "Downloaded", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Pending", START + timedelta(minutes=10)))
+    feed.publish("UC2", Upload("vid00000003", "Unsubscribed", START + timedelta(minutes=15)))
+    resolver = FakeResolver(FIRST, SECOND)
+    clock.advance()
+
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, clock, resolver=resolver, feed=feed, fetcher=fetcher)
+
+    assert "Active Subscriptions (1): First Channel" in caplog.text
+    assert fetcher.fetched == ["vid00000002"]
+    assert episode_numbers(media_library) == {"vid00000002": ("2026", "8")}
+    # Never looked up by the tool itself: due right away.
+    assert resolver.resolved == ["UC1"]
 
 
 def test_new_upload_lands_in_its_channel_folder_named_by_release_time_in_local_time(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     released = START + timedelta(minutes=10)
     feed.publish("UC1", Upload("vid00000001", "Part 1: The Start", released))
     clock.advance()
@@ -402,7 +471,6 @@ def test_new_upload_lands_in_its_channel_folder_named_by_release_time_in_local_t
     run_cycle(
         media_library,
         state,
-        account,
         clock,
         feed=feed,
         fetcher=fetcher,
@@ -427,11 +495,11 @@ def test_uploads_released_before_tracking_start_are_never_downloaded(
 ) -> None:
     feed.publish("UC1", Upload("old00000001", "Back catalogue", START - timedelta(days=1)))
     feed.publish("UC1", Upload("old00000002", "Same minute", START))
-    account = FakeAccount(FIRST)
+    subscribe(state, clock, FIRST)
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == []
     assert media_files(media_library) == []
@@ -440,19 +508,19 @@ def test_uploads_released_before_tracking_start_are_never_downloaded(
 def test_each_video_is_downloaded_once_across_cycles_and_restarts(
     media_library: Path, state_dir: Path, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
     with closing(StateStore.open(state_dir)) as state:
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        subscribe(state, clock, FIRST)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
         feed.publish("UC1", Upload("vid00000001", "Once", START + timedelta(minutes=5)))
         clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
         clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     # A restart in between: a new process on the same state file.
     with closing(StateStore.open(state_dir)) as state:
         clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001"]
 
@@ -460,28 +528,30 @@ def test_each_video_is_downloaded_once_across_cycles_and_restarts(
 def test_channel_rename_keeps_the_channel_folder(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-    account.current = [Subscription("UC1", "Renamed Channel", None, "")]
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    resolver = FakeResolver(replace(FIRST, display_name="Renamed Channel"))
     feed.publish("UC1", Upload("vid00000001", "After rename", START + timedelta(minutes=5)))
-    clock.advance()
+    clock.advance(timedelta(days=1))
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, resolver=resolver, feed=feed, fetcher=fetcher)
 
+    assert resolver.resolved == ["UC1"]
     basename = "First Channel - 2026-10-16 12-05 - After rename [vid00000001]"
     assert Path("First Channel", "Season 2026", f"{basename}.mkv") in media_files(media_library)
+    assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["title"] == "First Channel"
 
 
 def test_unsafe_characters_in_channel_and_title_are_replaced(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(Subscription("UC9", ".AC/DC: Live*", None, ""))
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, Channel("UC9", ".AC/DC: Live*", None, ""))
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     title = 'Q&A: "Why?" <1/2> | 10:30\tpm...'
     feed.publish("UC9", Upload("vid00000001", title, START + timedelta(minutes=5)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     basename = "AC_DC - Live_ - 2026-10-16 12-05 - Q&A - _Why__ _1_2_ _ 10-30 pm [vid00000001]"
     assert Path("AC_DC - Live_", "Season 2026", f"{basename}.mkv") in media_files(media_library)
@@ -490,12 +560,12 @@ def test_unsafe_characters_in_channel_and_title_are_replaced(
 def test_overlong_title_is_shortened_to_fit_a_filename(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "ä" * 300, START + timedelta(minutes=5)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     [video] = videos(media_library)
     assert video.name.endswith(" [vid00000001].mkv")
@@ -514,19 +584,19 @@ def test_failed_download_leaves_nothing_in_the_media_library_and_is_retried(
     caplog: pytest.LogCaptureFixture,
     error: Exception,
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Flaky", START + timedelta(minutes=5)))
     fetcher.errors["vid00000001"] = error
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert list(media_library.rglob("*")) == [media_library / ".youtube-helper-staging"]
     del fetcher.errors["vid00000001"]
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001", "vid00000001"]
     assert len(videos(media_library)) == 1
@@ -536,12 +606,12 @@ def test_video_appears_under_its_final_name_only_once_complete(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
     fetcher.media_library = media_library
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Big", START + timedelta(minutes=5)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.library_during_fetch == []
     assert len(videos(media_library)) == 1
@@ -555,22 +625,22 @@ def test_unreadable_feed_is_retried_next_cycle_while_other_channels_go_on(
     fetcher: FakeFetcher,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST, SECOND)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Hidden", START + timedelta(minutes=5)))
     feed.publish("UC2", Upload("vid00000002", "Visible", START + timedelta(minutes=5)))
     hidden = feed.channels["UC1"]
     feed.channels["UC1"] = FeedUnavailable("HTTP 500")
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert "Can't read the uploads of First Channel (HTTP 500)" in caplog.text
     assert fetcher.fetched == ["vid00000002"]
     feed.channels["UC1"] = hidden
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000002", "vid00000001"]
 
@@ -578,19 +648,19 @@ def test_unreadable_feed_is_retried_next_cycle_while_other_channels_go_on(
 def test_upload_left_pending_before_an_unsubscribe_is_not_fetched_after_resubscribing(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "In the gap", START + timedelta(minutes=5)))
     fetcher.errors["vid00000001"] = FetchFailed("HTTP Error 503")
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-    account.current = []
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    state.unsubscribe("UC1")
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     del fetcher.errors["vid00000001"]
-    account.current = [FIRST]
+    subscribe(state, clock, FIRST)
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001"]
     assert media_files(media_library) == []
@@ -599,8 +669,8 @@ def test_upload_left_pending_before_an_unsubscribe_is_not_fetched_after_resubscr
 def test_new_upload_gets_an_episode_nfo_next_to_it(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     released = START + timedelta(hours=11, minutes=30)
     feed.publish("UC1", Upload("vid00000001", "Tom & Jerry <live>", released))
     clock.advance(timedelta(hours=12))
@@ -608,7 +678,6 @@ def test_new_upload_gets_an_episode_nfo_next_to_it(
     run_cycle(
         media_library,
         state,
-        account,
         clock,
         feed=feed,
         fetcher=fetcher,
@@ -633,18 +702,18 @@ def test_new_upload_gets_an_episode_nfo_next_to_it(
 def test_episodes_are_numbered_per_channel_in_release_order_across_cycles(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST, SECOND)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
     feed.publish("UC2", Upload("vid00000002", "Other channel", START + timedelta(minutes=6)))
     feed.publish("UC1", Upload("vid00000003", "Two", START + timedelta(minutes=7)))
     feed.publish("UC1", Upload("vid00000004", "Three", START + timedelta(minutes=8)))
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000005", "Four", START + timedelta(minutes=40)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert episode_numbers(media_library) == {
         "vid00000001": ("2026", "1"),
@@ -658,18 +727,18 @@ def test_episodes_are_numbered_per_channel_in_release_order_across_cycles(
 def test_each_new_season_starts_at_episode_one(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     new_year = datetime(2027, 1, 1, tzinfo=UTC)
     feed.publish("UC1", Upload("vid00000001", "Autumn", START + timedelta(minutes=5)))
     feed.publish("UC1", Upload("vid00000002", "New Year's Eve", new_year - timedelta(minutes=1)))
     clock.now = new_year
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000003", "New Year", new_year + timedelta(minutes=1)))
     feed.publish("UC1", Upload("vid00000004", "January", new_year + timedelta(days=1)))
     clock.advance(timedelta(days=2))
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert episode_numbers(media_library) == {
         "vid00000001": ("2026", "1"),
@@ -686,19 +755,19 @@ def test_each_new_season_starts_at_episode_one(
 def test_video_arriving_late_gets_the_next_number_and_nothing_is_renumbered(
     media_library: Path, state_dir: Path, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
     with closing(StateStore.open(state_dir)) as state:
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        subscribe(state, clock, FIRST)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
         feed.publish("UC1", Upload("vid00000001", "Early", START + timedelta(minutes=5)))
         feed.publish("UC1", Upload("vid00000002", "Newer", START + timedelta(minutes=20)))
         clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     # A premiere released between the two shows up only later; a restart happens in between.
     feed.publish("UC1", Upload("vid00000003", "Premiere", START + timedelta(minutes=10)))
     clock.advance()
 
     with closing(StateStore.open(state_dir)) as state:
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert episode_numbers(media_library) == {
         "vid00000001": ("2026", "1"),
@@ -710,17 +779,17 @@ def test_video_arriving_late_gets_the_next_number_and_nothing_is_renumbered(
 def test_video_downloaded_after_a_failure_gets_the_next_number(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Flaky", START + timedelta(minutes=5)))
     feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=20)))
     fetcher.errors["vid00000001"] = FetchFailed("HTTP Error 503")
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     del fetcher.errors["vid00000001"]
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert episode_numbers(media_library) == {
         "vid00000001": ("2026", "2"),
@@ -731,13 +800,13 @@ def test_video_downloaded_after_a_failure_gets_the_next_number(
 def test_channel_folder_gets_a_tvshow_nfo_with_its_first_video(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     assert media_files(media_library) == []
     feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert nfo(media_library / "First Channel" / "tvshow.nfo") == (
         "tvshow",
@@ -745,36 +814,15 @@ def test_channel_folder_gets_a_tvshow_nfo_with_its_first_video(
     )
 
 
-def test_tvshow_nfo_is_written_from_the_last_known_subscription_while_the_login_has_lapsed(
-    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
-) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-    account.current = [Subscription("UC1", "Renamed Channel", None, "New description")]
-    clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-    account.current = LoginLapsed()
-    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=35)))
-    clock.advance()
-
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-
-    # The name stays the one from first sight, like the Channel folder; the plot is current.
-    assert nfo(media_library / "First Channel" / "tvshow.nfo") == (
-        "tvshow",
-        {"title": "First Channel", "plot": "New description", "uniqueid youtube": "UC1"},
-    )
-
-
 def test_channel_folder_gets_the_channel_avatar_as_poster(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     poster = media_library / "First Channel" / "poster.jpg"
     assert poster.read_bytes() == b"image https://yt3.ggpht.com/UC1"
@@ -789,13 +837,13 @@ def test_poster_that_cannot_be_downloaded_is_tried_again_next_cycle(
     artwork: FakeArtwork,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, artwork=artwork)
     feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
     artwork.errors[FIRST.avatar_url or ""] = ArtworkUnavailable("HTTP 503")
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, artwork=artwork)
 
     assert "Can't download the poster of First Channel (HTTP 503)" in caplog.text
     assert Path("First Channel", "poster.jpg") not in media_files(media_library)
@@ -803,7 +851,7 @@ def test_poster_that_cannot_be_downloaded_is_tried_again_next_cycle(
     artwork.errors.clear()
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, artwork=artwork)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, artwork=artwork)
 
     assert Path("First Channel", "poster.jpg") in media_files(media_library)
 
@@ -816,12 +864,12 @@ def test_channel_without_avatar_gets_no_poster(
     fetcher: FakeFetcher,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(THIRD)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, THIRD)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC3", Upload("vid00000001", "One", START + timedelta(minutes=5)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert Path("Third Channel", "tvshow.nfo") in media_files(media_library)
     assert Path("Third Channel", "poster.jpg") not in media_files(media_library)
@@ -831,15 +879,15 @@ def test_channel_without_avatar_gets_no_poster(
 def test_tvshow_nfo_follows_a_changed_channel_description(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
-    account.current = [replace(FIRST, description="About First, revised")]
-    clock.advance()
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    resolver = FakeResolver(replace(FIRST, description="About First, revised"))
+    clock.advance(timedelta(days=1))
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, resolver=resolver, feed=feed, fetcher=fetcher)
 
     assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["plot"] == "About First, revised"
 
@@ -853,19 +901,19 @@ def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_spac
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     disk = FakeDisk(free=9 * GIB)
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, disk=disk)
     feed.publish("UC1", Upload("vid00000001", "Waiting", START + timedelta(minutes=5)))
-    account.current = [FIRST, SECOND]
+    subscribe(state, clock, SECOND)
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, disk=disk)
 
     assert (
         f"Only 9.0 GiB free in the Media library {media_library}, less than 10.0 GiB; "
         "no more downloads this cycle, New uploads stay pending" in caplog.text
     )
-    assert "Started tracking Second Channel (UC2)" in caplog.text
+    assert "Active Subscriptions (2): First Channel, Second Channel" in caplog.text
     assert fetcher.fetched == []
     assert media_files(media_library) == []
     # Gone from the feed by now: only detection during the low-space cycle knows about it.
@@ -874,7 +922,7 @@ def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_spac
     caplog.clear()
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, disk=disk)
 
     assert "no more downloads" not in caplog.text
     assert fetcher.fetched == ["vid00000001"]
@@ -891,21 +939,21 @@ def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle
 ) -> None:
     disk = FakeDisk(free=11 * GIB)
     fetcher.disk = disk
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    subscribe(state, clock, FIRST, SECOND)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, disk=disk)
     feed.publish("UC1", Upload("vid00000001", "Fits", START + timedelta(minutes=5)))
     feed.publish("UC1", Upload("vid00000002", "Also fits", START + timedelta(minutes=6)))
     feed.publish("UC2", Upload("vid00000003", "Waits", START + timedelta(minutes=7)))
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, disk=disk)
 
     assert len(fetcher.fetched) == 2
     assert caplog.text.count("no more downloads this cycle") == 1
     disk.free = 100 * GIB
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher, disk=disk)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher, disk=disk)
 
     assert sorted(fetcher.fetched) == ["vid00000001", "vid00000002", "vid00000003"]
 
@@ -923,20 +971,20 @@ def test_videos_that_are_not_regular_are_excluded_and_never_evaluated_again(
     caplog: pytest.LogCaptureFixture,
     kind: str,
 ) -> None:
-    account = FakeAccount(FIRST)
     with closing(StateStore.open(state_dir)) as state:
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        subscribe(state, clock, FIRST)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
         feed.publish("UC1", Upload("vid00000001", "Not regular", START + timedelta(minutes=5)))
         fetcher.errors["vid00000001"] = NotRegularVideo(kind)
         clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
         clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     # A restart in between: a new process on the same state file.
     with closing(StateStore.open(state_dir)) as state:
         clock.advance()
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001"]
     assert media_files(media_library) == []
@@ -952,14 +1000,14 @@ def test_premiere_is_skipped_while_upcoming_and_downloaded_once_aired(
     fetcher: FakeFetcher,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Premiere", START + timedelta(minutes=5)))
     fetcher.errors["vid00000001"] = NotAiredYet("upcoming")
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert media_files(media_library) == []
     assert "Premiere (vid00000001) has not aired yet (upcoming)" in caplog.text
@@ -967,7 +1015,7 @@ def test_premiere_is_skipped_while_upcoming_and_downloaded_once_aired(
     del fetcher.errors["vid00000001"]
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001"] * 3
     basename = "First Channel - 2026-10-16 12-05 - Premiere [vid00000001]"
@@ -977,19 +1025,19 @@ def test_premiere_is_skipped_while_upcoming_and_downloaded_once_aired(
 def test_videos_not_downloaded_take_no_episode_number(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Short", START + timedelta(minutes=5)))
     feed.publish("UC1", Upload("vid00000002", "Premiere", START + timedelta(minutes=6)))
     feed.publish("UC1", Upload("vid00000003", "Regular", START + timedelta(minutes=7)))
     fetcher.errors["vid00000001"] = NotRegularVideo("a Short")
     fetcher.errors["vid00000002"] = NotAiredYet("upcoming")
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     del fetcher.errors["vid00000002"]
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert episode_numbers(media_library) == {
         "vid00000002": ("2026", "2"),
@@ -1004,14 +1052,13 @@ def new_upload_failing_with(
     clock: FakeClock,
     feed: FakeFeed,
     fetcher: FakeFetcher,
-) -> FakeAccount:
+) -> None:
     """Start tracking First Channel, then publish a New upload whose download raises `error`."""
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Doomed", START + timedelta(minutes=5)))
     fetcher.errors["vid00000001"] = error
     clock.advance()
-    return account
 
 
 def test_permanently_unavailable_video_is_skipped_logged_once_and_never_retried(
@@ -1023,10 +1070,10 @@ def test_permanently_unavailable_video_is_skipped_logged_once_and_never_retried(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     error = VideoUnavailable("Private video. Sign in if you've been granted access")
-    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
 
     for _ in range(3):
-        run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+        run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
         clock.advance()
 
     assert fetcher.fetched == ["vid00000001"]
@@ -1051,20 +1098,20 @@ def test_transiently_failing_video_is_retried_every_cycle_then_given_up_after_24
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     error = FetchFailed("HTTP Error 503: Service Unavailable")
-    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
     first_failure = clock.now
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     clock.now = first_failure + timedelta(hours=23, minutes=59)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001", "vid00000001"]
     assert "Gave up" not in caplog.text
     clock.now = first_failure + timedelta(hours=24)
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     clock.advance()
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001"] * 3
     assert (
@@ -1085,10 +1132,10 @@ def test_bot_check_is_called_out_and_retried(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     error = BotCheck("Sign in to confirm you're not a bot")
-    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
     feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=6)))
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert (
         "YouTube asked for a bot check while downloading Doomed (vid00000001); trying again"
@@ -1097,7 +1144,7 @@ def test_bot_check_is_called_out_and_retried(
     del fetcher.errors["vid00000001"]
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001", "vid00000002", "vid00000001"]
     assert len(videos(media_library)) == 2
@@ -1111,8 +1158,8 @@ def test_cycle_where_every_download_fails_says_once_that_yt_dlp_is_likely_outdat
     fetcher: FakeFetcher,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(FIRST, SECOND)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST, SECOND)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
     feed.publish("UC1", Upload("vid00000002", "Two", START + timedelta(minutes=6)))
     feed.publish("UC2", Upload("vid00000003", "Three", START + timedelta(minutes=7)))
@@ -1121,7 +1168,7 @@ def test_cycle_where_every_download_fails_says_once_that_yt_dlp_is_likely_outdat
     fetcher.errors["vid00000003"] = BotCheck("Sign in to confirm you're not a bot")
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert fetcher.fetched == ["vid00000001", "vid00000002", "vid00000003"]
     assert (
@@ -1137,7 +1184,7 @@ def test_cycle_where_every_download_fails_says_once_that_yt_dlp_is_likely_outdat
     caplog.clear()
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert len(videos(media_library)) == 3
     assert "outdated" not in caplog.text
@@ -1152,10 +1199,10 @@ def test_cycle_with_some_downloads_succeeding_reports_each_failure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     error = FetchFailed("HTTP Error 503")
-    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
     feed.publish("UC1", Upload("vid00000002", "Fine", START + timedelta(minutes=6)))
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert "Downloading Doomed (vid00000001) failed (HTTP Error 503); trying again" in caplog.text
     assert "outdated" not in caplog.text
@@ -1169,13 +1216,13 @@ def test_permanent_failures_alone_do_not_suggest_yt_dlp_is_outdated(
     fetcher: FakeFetcher,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = new_upload_failing_with(
+    new_upload_failing_with(
         VideoUnavailable("Video unavailable"), media_library, state, clock, feed, fetcher
     )
     feed.publish("UC1", Upload("vid00000002", "Flaky", START + timedelta(minutes=6)))
     fetcher.errors["vid00000002"] = FetchFailed("HTTP Error 503")
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert "Downloading Flaky (vid00000002) failed (HTTP Error 503); trying again" in caplog.text
     assert "outdated" not in caplog.text
@@ -1190,9 +1237,9 @@ def test_failing_writes_to_the_media_library_do_not_blame_yt_dlp(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     error = OSError(28, "No space left on device")
-    account = new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert (
         "Downloading Doomed (vid00000001) failed ([Errno 28] No space left on device);"
@@ -1209,8 +1256,8 @@ def test_videos_not_to_be_downloaded_neither_hide_nor_count_as_failing_downloads
     fetcher: FakeFetcher,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    account = FakeAccount(FIRST)
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     feed.publish("UC1", Upload("vid00000001", "Premiere", START + timedelta(minutes=5)))
     feed.publish("UC1", Upload("vid00000002", "Short", START + timedelta(minutes=6)))
     feed.publish("UC1", Upload("vid00000003", "Broken", START + timedelta(minutes=7)))
@@ -1219,17 +1266,17 @@ def test_videos_not_to_be_downloaded_neither_hide_nor_count_as_failing_downloads
     fetcher.errors["vid00000003"] = FetchFailed("Unable to extract player response")
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert "All downloads failing (1 this cycle" in caplog.text
     # A premiere upcoming for days is never given up on.
     del fetcher.errors["vid00000003"]
     clock.advance(timedelta(days=2))
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
     del fetcher.errors["vid00000001"]
     clock.advance()
 
-    run_cycle(media_library, state, account, clock, feed=feed, fetcher=fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
 
     assert "Gave up" not in caplog.text
     assert sorted(fetcher.fetched) == [

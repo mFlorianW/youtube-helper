@@ -7,12 +7,9 @@
 # Copy this file into an empty directory (e.g. /srv/youtube-helper/compose.yaml) and adjust
 # the values marked "adjust". All configuration lives here; there is no separate config file.
 #
-# Before the first start:
-# - create the host directories for the Media library and the state, writable by the user
-#   below (the tool never changes ownership or permissions);
-# - put the Google OAuth client ID and secret into the two secret files (see `secrets:`).
-# After the first start, log in once (see "Logging in" in the README):
-#   docker compose run --rm youtube-helper login
+# Before the first start, create the host directories for the Media library and the state,
+# writable by the user below (the tool never changes ownership or permissions).
+# After the first start, open the web UI (see `ports:`) and add the channels to follow.
 
 name: youtube-helper
 
@@ -21,8 +18,8 @@ services:
     image: ghcr.io/mflorianw/youtube-helper:latest
     # Come back after crashes and host reboots, but stay down after `docker compose stop`.
     restart: unless-stopped
-    # adjust: UID:GID that owns the Media library, the state directory and the secret files
-    # on the host (`id -u`, `id -g`). Files the tool writes belong to this user.
+    # adjust: UID:GID that owns the Media library and the state directory on the host
+    # (`id -u`, `id -g`). Files the tool writes belong to this user.
     user: "1000:1000"
     environment:
       # Where the Media library is mounted inside the container (must match `volumes:`).
@@ -34,33 +31,24 @@ services:
       # Where the SQLite state lives inside the container. /state is the default, so this
       # line is optional; it is shown only to explain the `/state` mount below.
       STATE_DIR: /state
+      # The port of the web UI inside the container (must match `ports:`). 8080 is the
+      # default, so this line is optional.
+      WEB_PORT: "8080"
+    # adjust: the host port of the web UI, e.g. http://<host>:8080. It has no login of its
+    # own: keep it inside your LAN, or put a reverse proxy with authentication in front.
+    ports:
+      - "8080:8080"
     volumes:
       # adjust: host path of the Media library. Point your media server at the same path.
       # It is checked for writability at startup and before every cycle; if it isn't
       # writable, the daemon exits with an error naming the directory.
       - /srv/media/youtube:/media-library:rw
       # adjust: host path for the state database (youtube-helper.sqlite3). Back it up;
-      # losing it means already tracked Subscriptions start over.
+      # losing it loses the Subscriptions.
       - /srv/youtube-helper/state:/state:rw
-    # Each secret appears read-only as a file /run/secrets/<name> in the container.
-    secrets:
-      - google_client_id
-      - google_client_secret
     # Logs go to stdout; rotate them so `docker logs` can't fill the disk.
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
-# Compose (without Swarm) bind-mounts each secret file into the container: it is not
-# encrypted, and the host file's owner and mode apply. Keep the files readable only by the
-# user above, e.g. `chmod 600 secrets/*` after `chown 1000:1000 secrets/*`.
-# For encrypted secrets with no files on the host, deploy with Swarm instead (stack.yaml).
-secrets:
-  google_client_id:
-    # A file containing only the OAuth client ID ("…apps.googleusercontent.com").
-    file: ./secrets/google_client_id
-  google_client_secret:
-    # A file containing only the OAuth client secret.
-    file: ./secrets/google_client_secret
