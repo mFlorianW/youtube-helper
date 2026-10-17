@@ -2,14 +2,15 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-"""The web UI: the owner's Subscriptions, listed, added and removed in the browser."""
+"""The web UI: the owner's Subscriptions, listed, added and removed in the browser, and the
+status of the last cycle with whatever needs the owner's attention."""
 
 import logging
 import socket
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
 from youtube_helper.channels import Channel, ChannelResolver, ChannelUnavailable, NotAChannel
+from youtube_helper.cycle import BOT_CHECK_ADVICE, RETRY_PERIOD, format_size
 from youtube_helper.state import StateStore, Subscribed, TrackedSubscription
 
 log = logging.getLogger(__name__)
@@ -44,16 +46,26 @@ def create_app(
     templates.env.filters["local_time"] = lambda moment: moment.astimezone(timezone).strftime(
         "%Y-%m-%d %H:%M"
     )
+    templates.env.filters["size"] = format_size
+    templates.env.globals["bot_check_advice"] = BOT_CHECK_ADVICE
+    templates.env.globals["retry_hours"] = RETRY_PERIOD // timedelta(hours=1)
     previews: OrderedDict[str, Channel] = OrderedDict()
 
     # The state store blocks while a cycle uses it, so it is only ever called off the event loop.
     def active() -> list[TrackedSubscription]:
         return [s for s in state.tracked_subscriptions() if s.active]
 
+    def dashboard() -> dict[str, object]:
+        """What every page and fragment shows: the Subscriptions with their problems, the status."""
+        return {
+            "subscriptions": active(),
+            "outcome": state.last_cycle(),
+            "problems": state.download_problems(clock()),
+        }
+
     async def render(request: Request, template: str, **context: object) -> Response:
-        subscriptions = await run_in_threadpool(active)
         return templates.TemplateResponse(
-            request, template, {"subscriptions": subscriptions, **context}
+            request, template, {**await run_in_threadpool(dashboard), **context}
         )
 
     def is_htmx(request: Request) -> bool:
@@ -76,6 +88,10 @@ def create_app(
 
     async def index(request: Request) -> Response:
         return await render(request, "index.html")
+
+    async def status(request: Request) -> Response:
+        """The status with the Subscriptions' problems, as polled by the page."""
+        return await render(request, "_status_poll.html")
 
     async def preview(request: Request) -> Response:
         reference = str((await request.form()).get("channel", "")).strip()
@@ -130,6 +146,7 @@ def create_app(
     return Starlette(
         routes=[
             Route("/", index),
+            Route("/status", status),
             Route("/preview", preview, methods=["POST"]),
             Route("/subscriptions", add, methods=["POST"]),
             Route("/subscriptions/{channel_id}/remove", remove, methods=["POST"]),

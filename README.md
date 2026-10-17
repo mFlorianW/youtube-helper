@@ -60,13 +60,36 @@ purpose. With Docker Swarm, change the job's commands to
 
 ## Web UI
 
-The daemon serves a small web UI on port 8080 (`WEB_PORT`) for managing the Subscriptions.
-It has no login of its own: keep the port inside your LAN, or put a reverse proxy with
+The daemon serves a small web UI on port 8080 (`WEB_PORT`) for managing the Subscriptions and
+checking on the tool. It has no login of its own: keep the port inside your LAN, or put a reverse proxy with
 authentication in front of it if you expose it any further.
 
 To add a channel, paste its `@handle`, its channel URL or the URL of any of its videos and click
 **Look up**. youtube-helper looks the channel up on YouTube and shows its avatar and name;
-**Subscribe** adds it. **Remove** next to a Subscription removes it again.
+**Subscribe** adds it. **Remove** next to a Subscription removes it again. These are the only
+actions; everything else on the page is information.
+
+### Status
+
+The page shows what the last cycle did, refreshed on its own every 30 seconds:
+
+- **Last cycle**: when it started and finished, and how many New uploads it downloaded.
+- Warnings that need your attention. Each stays until a later cycle no longer finds the problem:
+  - **All downloads failing**: every download of the last cycle that tried any failed in
+    yt-dlp, which is likely outdated; pull the latest image. If YouTube asked for bot checks,
+    the warning says so: a PO-token provider is needed if this keeps happening.
+  - **Low free space**: the free space in the Media library and the 10 GiB threshold below
+    which downloads are paused.
+  - **Media library not writable**, naming the directory: cycles are skipped until it is.
+
+Each Subscription lists its own problems:
+
+- videos being retried, with their last error and when they first failed;
+- videos given up on after 24 hours or skipped for good, with their errors, for 30 days;
+- a note when the channel's upload feed couldn't be read in the last cycle.
+
+Videos excluded on purpose (Shorts, livestreams) are not shown. The status is kept in the state
+database, so it survives restarts.
 
 ## Subscriptions
 
@@ -114,10 +137,10 @@ yt-dlp (never with any cookies) and filed into the Media library:
   are logged once as `Excluded` and never looked at again. A premiere is left alone while it is
   upcoming or still airing and downloaded once it has aired, like any regular video.
 - Each video is downloaded once, also across restarts.
-- Before each download the daemon checks the free space in the Media library. Below 10 GiB it
-  logs `Only … GiB free in the Media library …` and downloads nothing more that cycle. The New
-  uploads stay pending and are downloaded automatically once there is enough space again;
-  upload feeds are still read in the meantime.
+- Every cycle and before each download the daemon checks the free space in the Media library.
+  Below 10 GiB it logs `Only … GiB free in the Media library …` and downloads nothing more that
+  cycle. The New uploads stay pending and are downloaded automatically once there is enough
+  space again; upload feeds are still read in the meantime.
 
 ### When downloads fail
 
@@ -164,7 +187,9 @@ All configuration is passed to the container by Compose. There is no config file
 | `user`                         | Compose service key  | root     | UID:GID the tool runs as. It must be able to write the Media library and state directory.                         |
 
 The daemon checks that the Media library is writable at startup and before every cycle. If it
-isn't, the daemon exits non-zero with an error naming the directory. youtube-helper never
+isn't, the daemon logs an error naming the directory, skips the cycle and tries again 30 minutes
+later; it keeps running, and the web UI shows the problem. A missing `MEDIA_LIBRARY`, an unknown
+`TZ` or a state database that can't be opened stop the daemon at startup. youtube-helper never
 changes ownership or permissions; setting them up is the admin's job.
 
 ## Development

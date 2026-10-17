@@ -4,7 +4,6 @@
 
 import logging
 import os
-import re
 import sqlite3
 import xml.etree.ElementTree as ET
 from contextlib import closing
@@ -18,8 +17,15 @@ import pytest
 from youtube_helper.artwork import ArtworkUnavailable
 from youtube_helper.channels import Channel, ChannelUnavailable
 from youtube_helper.cycle import Cycle
-from youtube_helper.media_library import MediaLibraryUnwritable
-from youtube_helper.state import DATABASE_NAME, MIGRATIONS, StateStore
+from youtube_helper.state import (
+    DATABASE_NAME,
+    MIGRATIONS,
+    AllDownloadsFailed,
+    CycleOutcome,
+    DownloadProblem,
+    LowSpace,
+    StateStore,
+)
 from youtube_helper.upload_feed import FeedUnavailable, Upload
 from youtube_helper.video_fetcher import (
     BotCheck,
@@ -229,24 +235,110 @@ def test_cycle_with_writable_media_library_is_logged(
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write to read-only directories")
-def test_cycle_with_read_only_media_library_fails_naming_the_directory(
-    media_library: Path, state: StateStore
+def test_cycle_with_read_only_media_library_is_skipped_naming_the_directory(
+    media_library: Path, state: StateStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     media_library.chmod(0o555)
     try:
-        with pytest.raises(MediaLibraryUnwritable, match=re.escape(str(media_library))):
-            run_cycle(media_library, state)
+        run_cycle(media_library, state)
     finally:
         media_library.chmod(0o755)
 
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.unwritable is not None
+    assert f"Media library {media_library} is not writable" in outcome.unwritable
+    assert "Cycle started" not in caplog.text
 
-def test_cycle_with_missing_media_library_fails_naming_the_directory(
-    tmp_path: Path, state: StateStore
+
+def test_cycle_with_missing_media_library_is_skipped_naming_the_directory(
+    tmp_path: Path,
+    state: StateStore,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     missing = tmp_path / "missing"
+    subscribe(state, None, FIRST)
+    feed.publish("UC1", Upload("vid00000001", "Waiting", START + timedelta(minutes=5)))
 
-    with pytest.raises(MediaLibraryUnwritable, match=re.escape(str(missing))):
-        run_cycle(missing, state)
+    run_cycle(missing, state, feed=feed, fetcher=fetcher)
+
+    assert (
+        f"Media library {missing} is not writable: No such file or directory;"
+        " skipping this cycle, trying again next cycle" in caplog.text
+    )
+    assert fetcher.fetched == []
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert (
+        outcome.unwritable == f"Media library {missing} is not writable: No such file or directory"
+    )
+    assert outcome.downloaded == 0
+
+
+def test_unwritable_media_library_warning_clears_once_it_is_writable_again(
+    tmp_path: Path, state: StateStore, clock: FakeClock
+) -> None:
+    library = tmp_path / "library"
+    run_cycle(library, state, clock)
+    library.mkdir()
+    clock.advance()
+
+    run_cycle(library, state, clock)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.unwritable is None
+
+
+def test_skipped_cycle_keeps_the_warnings_it_could_not_check(
+    tmp_path: Path, state: StateStore, clock: FakeClock, feed: FakeFeed
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    subscribe(state, clock, FIRST)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    run_cycle(library, state, clock, feed=feed, disk=FakeDisk(free=GIB))
+    library.rmdir()
+    clock.advance()
+
+    run_cycle(library, state, clock, feed=feed)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.unwritable is not None
+    assert outcome.started == clock.now
+    assert outcome.low_space == LowSpace(free=GIB, threshold=10 * GIB)
+    assert outcome.feed_failures == {"UC1": "HTTP 500"}
+
+
+def test_cycle_records_when_it_ran_and_how_many_new_uploads_it_downloaded(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    assert state.last_cycle() is None
+    subscribe(state, clock, FIRST, SECOND)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    feed.publish("UC2", Upload("vid00000002", "Two", START + timedelta(minutes=6)))
+    feed.publish("UC2", Upload("vid00000003", "Broken", START + timedelta(minutes=7)))
+    fetcher.errors["vid00000003"] = FetchFailed("HTTP Error 503")
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+
+    assert state.last_cycle() == CycleOutcome(started=clock.now, finished=clock.now, downloaded=2)
+
+
+def test_cycle_outcome_survives_a_restart(
+    media_library: Path, state_dir: Path, clock: FakeClock
+) -> None:
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, clock, disk=FakeDisk(free=GIB))
+        recorded = state.last_cycle()
+
+    with closing(StateStore.open(state_dir)) as state:
+        assert state.last_cycle() == recorded
 
 
 def test_cycle_follows_the_active_subscriptions(
@@ -645,6 +737,27 @@ def test_unreadable_feed_is_retried_next_cycle_while_other_channels_go_on(
     assert fetcher.fetched == ["vid00000002", "vid00000001"]
 
 
+def test_unreadable_feed_is_recorded_for_its_channel_until_it_can_be_read_again(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed
+) -> None:
+    subscribe(state, clock, FIRST, SECOND)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+
+    run_cycle(media_library, state, clock, feed=feed)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.feed_failures == {"UC1": "HTTP 500"}
+    feed.channels["UC1"] = []
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.feed_failures == {}
+
+
 def test_upload_left_pending_before_an_unsubscribe_is_not_fetched_after_resubscribing(
     media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
 ) -> None:
@@ -927,6 +1040,27 @@ def test_low_disk_space_skips_downloads_and_keeps_new_uploads_pending_until_spac
     assert "no more downloads" not in caplog.text
     assert fetcher.fetched == ["vid00000001"]
     assert len(videos(media_library)) == 1
+
+
+def test_low_disk_space_is_recorded_until_space_returns(
+    media_library: Path, state: StateStore, clock: FakeClock
+) -> None:
+    disk = FakeDisk(free=9 * GIB)
+
+    # Even without anything to download: downloads are paused all the same.
+    run_cycle(media_library, state, clock, disk=disk)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.low_space == LowSpace(free=9 * GIB, threshold=10 * GIB)
+    disk.free = 10 * GIB
+    clock.advance()
+
+    run_cycle(media_library, state, clock, disk=disk)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.low_space is None
 
 
 def test_downloads_stop_once_free_space_drops_below_the_threshold_during_a_cycle(
@@ -1288,3 +1422,126 @@ def test_videos_not_to_be_downloaded_neither_hide_nor_count_as_failing_downloads
         "vid00000003",
     ]
     assert len(videos(media_library)) == 2
+
+
+def test_cycle_where_every_download_fails_is_recorded_until_a_download_succeeds(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    subscribe(state, clock, FIRST)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    feed.publish("UC1", Upload("vid00000001", "One", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Two", START + timedelta(minutes=6)))
+    fetcher.errors["vid00000001"] = FetchFailed("Unable to extract player response")
+    fetcher.errors["vid00000002"] = BotCheck("Sign in to confirm you're not a bot")
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.all_downloads_failed == AllDownloadsFailed(
+        attempts=2, last_error="Sign in to confirm you're not a bot", bot_checks=1
+    )
+    fetcher.errors.clear()
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.all_downloads_failed is None
+
+
+def test_cycle_without_downloads_keeps_the_verdict_on_yt_dlp(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    error = FetchFailed("Unable to extract player response")
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    # Given up on: the next cycle has nothing left to try.
+    clock.advance(timedelta(hours=24))
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+
+    outcome = state.last_cycle()
+    assert outcome is not None
+    assert outcome.all_downloads_failed == AllDownloadsFailed(
+        attempts=1, last_error="Unable to extract player response", bot_checks=0
+    )
+
+
+def test_videos_being_retried_are_problems_of_their_subscription(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    error = FetchFailed("HTTP Error 503")
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    first_failure = clock.now
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    fetcher.errors["vid00000001"] = FetchFailed("HTTP Error 429")
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+
+    assert state.download_problems(clock.now) == {
+        "UC1": [
+            DownloadProblem(
+                "vid00000001", "Doomed", "retrying", "HTTP Error 429", first_failure, None
+            )
+        ]
+    }
+    del fetcher.errors["vid00000001"]
+    clock.advance()
+
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+
+    assert state.download_problems(clock.now) == {}
+
+
+def test_videos_given_up_or_skipped_are_problems_for_30_days(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    error = FetchFailed("HTTP Error 503")
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    feed.publish("UC1", Upload("vid00000002", "Private", START + timedelta(minutes=6)))
+    feed.publish("UC1", Upload("vid00000003", "Short", START + timedelta(minutes=7)))
+    fetcher.errors["vid00000002"] = VideoUnavailable("Private video")
+    fetcher.errors["vid00000003"] = NotRegularVideo("a Short")
+    first_failure = clock.now
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    clock.advance(timedelta(hours=24))
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+    gave_up = clock.now
+
+    clock.advance(timedelta(days=30) - timedelta(hours=24))
+
+    assert state.download_problems(clock.now) == {
+        "UC1": [
+            DownloadProblem(
+                "vid00000001", "Doomed", "failed", "HTTP Error 503", first_failure, gave_up
+            ),
+            DownloadProblem(
+                "vid00000002", "Private", "skipped", "Private video", None, first_failure
+            ),
+        ]
+    }
+    clock.advance(timedelta(hours=24, seconds=1))
+
+    assert state.download_problems(clock.now) == {}
+
+
+def test_problems_of_unsubscribed_channels_are_not_shown(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, fetcher: FakeFetcher
+) -> None:
+    error = FetchFailed("HTTP Error 503")
+    new_upload_failing_with(error, media_library, state, clock, feed, fetcher)
+    run_cycle(media_library, state, clock, feed=feed, fetcher=fetcher)
+
+    state.unsubscribe("UC1")
+
+    assert state.download_problems(clock.now) == {}
+    # Left pending from before: back catalogue once tracking restarts, so no problem.
+    clock.advance()
+    subscribe(state, clock, FIRST)
+    assert state.download_problems(clock.now) == {}

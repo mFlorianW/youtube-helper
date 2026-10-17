@@ -2,8 +2,8 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-"""The daemon: serves the web UI and runs one Cycle every 30 minutes until stopped or it can no
-longer continue."""
+"""The daemon: serves the web UI and runs one Cycle every 30 minutes until stopped or it can't
+start."""
 
 import logging
 import time
@@ -17,7 +17,6 @@ from youtube_helper.artwork import HttpArtwork
 from youtube_helper.channels import YtDlpResolver
 from youtube_helper.config import ConfigError, load_config
 from youtube_helper.cycle import Cycle
-from youtube_helper.media_library import MediaLibraryUnwritable, ensure_writable
 from youtube_helper.state import StateStore, StateUnavailable
 from youtube_helper.upload_feed import YouTubeFeed
 from youtube_helper.video_fetcher import YtDlpFetcher
@@ -39,10 +38,12 @@ log = logging.getLogger(__name__)
 
 
 def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = time.sleep) -> int:
-    """Run cycles forever; return a non-zero exit status when the daemon can't continue."""
+    """Run cycles forever; return a non-zero exit status when the daemon can't start.
+
+    An unwritable Media library doesn't stop it: each cycle is skipped until it is writable.
+    """
     try:
         config = load_config(environ)
-        ensure_writable(config.media_library)
         log.info(
             "Starting with Media library %s, state in %s, time zone %s",
             config.media_library,
@@ -70,6 +71,6 @@ def run_daemon(environ: Mapping[str, str], *, sleep: Callable[[float], None] = t
             while True:
                 cycle.run()
                 sleep(CYCLE_INTERVAL.total_seconds())
-    except (ConfigError, MediaLibraryUnwritable, StateUnavailable, WebUnavailable) as error:
+    except (ConfigError, StateUnavailable, WebUnavailable) as error:
         log.error("%s", error)
         return 1

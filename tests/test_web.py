@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 import logging
+import re
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from html import unescape
 from zoneinfo import ZoneInfo
@@ -11,10 +13,17 @@ import pytest
 from starlette.testclient import TestClient
 
 from youtube_helper.channels import Channel, ChannelUnavailable, NotAChannel
-from youtube_helper.state import StateStore
+from youtube_helper.state import (
+    AllDownloadsFailed,
+    CycleOutcome,
+    LowSpace,
+    StateStore,
+)
+from youtube_helper.upload_feed import Upload
 from youtube_helper.web import create_app
 
 START = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+GIB = 1024**3
 
 FIRST = Channel("UC1", "First Channel", "https://yt3.ggpht.com/UC1", "About First")
 SECOND = Channel("UC2", "Second Channel", None, "")
@@ -257,3 +266,157 @@ def test_page_serves_its_styles_and_scripts(client: TestClient) -> None:
     for asset in ("/static/pico.min.css", "/static/htmx.min.js"):
         assert asset in html
         assert client.get(asset).status_code == 200
+
+
+def status(client: TestClient) -> str:
+    """The status fragment the page polls for, as htmx asks for it."""
+    response = client.get("/status", headers={"HX-Request": "true"})
+    assert response.status_code == 200
+    assert "<html" not in response.text
+    return unescape(response.text)
+
+
+def subscription_on(html: str, name: str) -> str:
+    """The text listing the Subscription called `name`, without markup."""
+    section = html.split('id="subscriptions"', 1)[1]
+    listing = section.split(f'<span class="channel-name">{name}</span>', 1)[1]
+    listing = listing.split('<li class="channel">', 1)[0]
+    return " ".join(re.sub(r"<[^>]+>", "", listing).split())
+
+
+LAST_CYCLE = CycleOutcome(started=START, finished=START + timedelta(minutes=3), downloaded=2)
+
+
+def test_page_polls_the_status_every_30_seconds(client: TestClient) -> None:
+    html = page(client)
+
+    assert 'hx-get="/status"' in html
+    assert 'hx-trigger="every 30s"' in html
+
+
+def test_status_before_the_first_cycle_says_so(client: TestClient) -> None:
+    html = status(client)
+
+    assert "No cycle has run yet" in html
+
+
+def test_status_shows_the_last_cycle_in_local_time(client: TestClient, state: StateStore) -> None:
+    state.record_cycle(LAST_CYCLE)
+
+    html = status(client)
+
+    assert "Last cycle: 2026-10-16 14:00 to 2026-10-16 14:03, 2 New uploads downloaded" in html
+    assert "Nothing needs your attention" in html
+    assert "Last cycle: 2026-10-16 14:00" in page(client)
+
+
+def test_status_says_when_yt_dlp_is_likely_outdated(client: TestClient, state: StateStore) -> None:
+    state.record_cycle(
+        replace(LAST_CYCLE, all_downloads_failed=AllDownloadsFailed(3, "HTTP Error 403", 0))
+    )
+
+    html = status(client)
+
+    assert (
+        "All downloads failing (3 in the last cycle that tried any, last error: HTTP Error 403):"
+        " yt-dlp is likely outdated, pull the latest image" in html
+    )
+    assert "bot check" not in html
+    assert "Nothing needs your attention" not in html
+
+
+def test_status_gives_the_po_token_hint_when_youtube_asked_for_bot_checks(
+    client: TestClient, state: StateStore
+) -> None:
+    state.record_cycle(
+        replace(LAST_CYCLE, all_downloads_failed=AllDownloadsFailed(3, "Sign in to confirm", 2))
+    )
+
+    html = status(client)
+
+    assert "yt-dlp is likely outdated, pull the latest image" in html
+    assert (
+        "YouTube asked 2 of them for a bot check. If this keeps happening, a PO-token provider"
+        " is needed" in html
+    )
+
+
+def test_status_warns_about_low_free_space(client: TestClient, state: StateStore) -> None:
+    state.record_cycle(replace(LAST_CYCLE, low_space=LowSpace(free=9 * GIB, threshold=10 * GIB)))
+
+    html = status(client)
+
+    assert (
+        "Only 9.0 GiB free in the Media library, less than 10.0 GiB: downloads are paused" in html
+    )
+
+
+def test_status_names_an_unwritable_media_library(client: TestClient, state: StateStore) -> None:
+    state.record_cycle(
+        replace(
+            LAST_CYCLE, unwritable="Media library /media/youtube is not writable: Permission denied"
+        )
+    )
+
+    html = status(client)
+
+    assert "Media library /media/youtube is not writable: Permission denied" in html
+    assert "cycles are skipped until it is" in html
+
+
+def failing(state: StateStore, video_id: str, title: str, error: str, at: datetime) -> None:
+    """Record a New upload of First Channel whose download failed at `at`."""
+    state.record_uploads("UC1", [Upload(video_id, title, START + timedelta(minutes=5))])
+    state.record_failure(video_id, error, at)
+
+
+def test_each_subscription_shows_its_failing_videos(
+    client: TestClient, state: StateStore, clock: FakeClock
+) -> None:
+    add(client, "UC1")
+    add(client, "UC2")
+    failing(state, "vid00000001", "Flaky", "HTTP Error 503", START + timedelta(hours=1))
+    failing(state, "vid00000002", "Doomed", "HTTP Error 404", START + timedelta(hours=1))
+    state.mark_failed("vid00000002", START + timedelta(hours=25))
+    state.record_uploads("UC1", [Upload("vid00000003", "Private", START + timedelta(minutes=6))])
+    state.mark_skipped("vid00000003", "Private video", START + timedelta(hours=2))
+    state.record_uploads("UC1", [Upload("vid00000004", "A Short", START + timedelta(minutes=7))])
+    state.mark_excluded("vid00000004")
+    clock.now = START + timedelta(days=2)
+
+    first = subscription_on(status(client), "First Channel")
+    second = subscription_on(status(client), "Second Channel")
+
+    assert "Retrying Flaky: HTTP Error 503 (failing since 2026-10-16 15:00)" in first
+    assert "Gave up on Doomed on 2026-10-17 15:00 after 24 hours: HTTP Error 404" in first
+    assert "Skipped Private for good on 2026-10-16 16:00: Private video" in first
+    assert "A Short" not in first
+    assert "Retrying" not in second
+    assert "Retrying Flaky" in subscription_on(page(client), "First Channel")
+
+
+def test_videos_given_up_more_than_30_days_ago_are_no_longer_shown(
+    client: TestClient, state: StateStore, clock: FakeClock
+) -> None:
+    add(client, "UC1")
+    failing(state, "vid00000001", "Doomed", "HTTP Error 404", START)
+    state.mark_failed("vid00000001", START + timedelta(hours=24))
+    clock.now = START + timedelta(days=31, hours=1)
+
+    assert "Doomed" not in subscription_on(status(client), "First Channel")
+
+
+def test_subscription_whose_feed_could_not_be_read_says_so(
+    client: TestClient, state: StateStore
+) -> None:
+    add(client, "UC1")
+    add(client, "UC2")
+    state.record_cycle(replace(LAST_CYCLE, feed_failures={"UC2": "HTTP 500"}))
+
+    html = status(client)
+
+    assert "feed" not in subscription_on(html, "First Channel")
+    assert (
+        "Couldn't read the channel's feed in the last cycle (HTTP 500); trying again next cycle"
+        in subscription_on(html, "Second Channel")
+    )
