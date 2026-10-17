@@ -321,13 +321,14 @@ class VideoWarning:
 
     @property
     def short(self) -> str:
+        """What happened to the video, in a few words: its title in a subject."""
         return f"{'Gave up on' if self.gave_up else 'Skipped'} {self.title}"
 
 
 @dataclass(frozen=True)
-class Report:
-    """What a Notification reports: Warnings raised since the last one delivered, the titles of
-    those cleared since, and the videos filed since."""
+class Changes:
+    """What changed since the last Notification delivered: Warnings raised, the titles of those
+    cleared, and the videos filed."""
 
     raised: Sequence[LastingWarning] = ()
     videos: Sequence[VideoWarning] = ()
@@ -339,13 +340,14 @@ class Report:
 
 
 def local_time(moment: datetime, timezone: ZoneInfo) -> str:
+    """`moment` as a Notification tells it: in local time, naming the time zone."""
     return moment.astimezone(timezone).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def notification(
-    report: Report, failure: NotificationFailure | None, timezone: ZoneInfo, retry_hours: int
+    changes: Changes, failure: NotificationFailure | None, timezone: ZoneInfo, retry_hours: int
 ) -> tuple[str, str]:
-    """The subject and plain text of the Notification of `report`: raised Warnings, then cleared
+    """The subject and plain text of the Notification of `changes`: raised Warnings, then cleared
     ones, then the filed videos, grouped by Subscription in the order given.
 
     After a failure, it says since when Notifications were failing.
@@ -358,7 +360,7 @@ def notification(
             " this one covers everything since then.",
             "",
         ]
-    raised = [w.title for w in report.raised] + [v.short for v in report.videos]
+    raised = [w.title for w in changes.raised] + [v.short for v in changes.videos]
     if raised:
         others = len(raised) - 1
         subject.append(
@@ -366,23 +368,23 @@ def notification(
             + (f" and {others} more Warning{'' if others == 1 else 's'}" if others else "")
         )
         lines += ["⚠ Raised", ""]
-        lines += [f"- {warning.detail}" for warning in report.raised]
-        for warned in report.videos:
+        lines += [f"- {warning.detail}" for warning in changes.raised]
+        for warned in changes.videos:
             how = f"after failing for {retry_hours} hours" if warned.gave_up else "for good"
             lines += [
                 f"- {warned.short} ({warned.subscription}) {how}: {warned.error}",
                 f"  {_youtube_link(warned.video_id)}",
             ]
         lines.append("")
-    if report.cleared:
-        count = len(report.cleared)
+    if changes.cleared:
+        count = len(changes.cleared)
         subject.append(
-            f"{report.cleared[0]} cleared" if count == 1 else f"{count} Warnings cleared"
+            f"{changes.cleared[0]} cleared" if count == 1 else f"{count} Warnings cleared"
         )
         lines += ["✓ Cleared", ""]
-        lines += [f"- {title}" for title in report.cleared]
+        lines += [f"- {title}" for title in changes.cleared]
         lines.append("")
-    if filed := report.filed:
+    if filed := changes.filed:
         count_videos = f"{len(filed)} new video{'' if len(filed) == 1 else 's'}"
         subject.append(count_videos)
         lines.append(

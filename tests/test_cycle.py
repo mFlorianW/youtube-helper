@@ -2163,6 +2163,24 @@ def test_warning_of_a_removed_subscription_disappears_without_being_reported_cle
     assert subjects(again) == ["youtube-helper: ⚠ Feed of First Channel unreadable"]
 
 
+def test_feed_of_a_subscription_made_again_fails_for_24_hours_before_it_is_a_warning(
+    media_library: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
+) -> None:
+    subscribe(state, clock, FIRST)
+    state.save_email_settings(WARNINGS)
+    feed.channels["UC1"] = FeedUnavailable("HTTP 500")
+    cycles(media_library, state, clock, mailer, 48, feed=feed)
+
+    # Removed and made again between two cycles.
+    state.unsubscribe("UC1")
+    subscribe(state, clock, FIRST)
+    soon = cycles(media_library, state, clock, mailer, 48, feed=feed)
+    later = cycles(media_library, state, clock, mailer, feed=feed)
+
+    assert soon == []
+    assert subjects(later) == ["youtube-helper: ⚠ Feed of First Channel unreadable"]
+
+
 def test_video_given_up_on_or_skipped_is_reported_once_and_never_as_cleared(
     media_library: Path,
     state: StateStore,
@@ -2226,7 +2244,7 @@ def test_one_notification_holds_raised_then_cleared_warnings_then_new_videos(
     assert content.index("⚠ Raised") < content.index("✓ Cleared") < content.index("1 new video")
 
 
-def test_subject_names_the_first_warning_and_counts_the_rest(
+def test_subject_counts_the_warnings_cleared(
     tmp_path: Path, state: StateStore, clock: FakeClock, feed: FakeFeed, mailer: FakeMailer
 ) -> None:
     subscribe(state, clock, FIRST)

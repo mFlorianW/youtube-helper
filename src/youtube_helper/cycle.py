@@ -27,10 +27,10 @@ from youtube_helper.media_library import (
 )
 from youtube_helper.nfo import episode_nfo, tvshow_nfo
 from youtube_helper.notifications import (
+    Changes,
     LastingWarning,
     Mailer,
     MailError,
-    Report,
     failure_warning,
     feed_warning_key,
     local_time,
@@ -158,7 +158,7 @@ class Cycle:
         if not (settings.reports_new_videos or settings.reports_warnings):
             self._state.clear_notification_failure()
             return
-        report = Report(
+        changes = Changes(
             filed=self._state.unreported_videos() if settings.reports_new_videos else ()
         )
         active = None
@@ -166,16 +166,16 @@ class Cycle:
             active = self._lasting_warnings()
             reported = self._state.reported_warnings()
             keys = {warning.key for warning in active}
-            report = replace(
-                report,
+            changes = replace(
+                changes,
                 raised=[warning for warning in active if warning.key not in reported],
                 videos=self._state.unreported_video_warnings(),
                 cleared=[title for key, title in reported.items() if key not in keys],
             )
-        if not report:
+        if not changes:
             return
         subject, content = notification(
-            report,
+            changes,
             self._state.notification_failure(),
             self._timezone,
             RETRY_PERIOD // timedelta(hours=1),
@@ -193,7 +193,7 @@ class Cycle:
             log.error("%s; trying again next cycle", warning)
             self._state.notification_failed(warning, self._clock())
             return
-        self._state.notification_delivered(report, active)
+        self._state.notification_delivered(changes, active)
         log.info("Sent the Notification %r to %s", subject, ", ".join(settings.recipients))
 
     def _lasting_warnings(self) -> list[LastingWarning]:

@@ -17,13 +17,13 @@ from typing import Any, Literal, Self
 from youtube_helper.channels import Channel
 from youtube_helper.media_library import channel_folder
 from youtube_helper.notifications import (
+    Changes,
     EmailSettings,
     FiledVideo,
     LastingWarning,
     NotificationFailure,
     PasswordCipher,
     PasswordState,
-    Report,
     SavedEmailSettings,
     Security,
     VideoWarning,
@@ -315,6 +315,8 @@ class StateStore:
             connection.execute(
                 "DELETE FROM reported_warning WHERE key = ?", (feed_warning_key(channel_id),)
             )
+            # Subscribing again starts the 24 hours afresh.
+            connection.execute("DELETE FROM feed_failure WHERE channel_id = ?", (channel_id,))
         return replace(_tracked(row), active=False)
 
     def refresh_details(self, channel: Channel, at: datetime) -> None:
@@ -559,20 +561,20 @@ class StateStore:
             )
 
     def notification_delivered(
-        self, report: Report, active: Iterable[LastingWarning] | None = None
+        self, changes: Changes, active: Iterable[LastingWarning] | None = None
     ) -> None:
-        """Remember that a Notification of `report` was delivered: Notifications work again.
+        """Remember that a Notification of `changes` was delivered: Notifications work again.
 
         `active` are the lasting Warnings active as of it, None if it doesn't report Warnings.
         """
         with self._transaction() as connection:
             connection.executemany(
                 "UPDATE video SET unreported = 0 WHERE video_id = ?",
-                [(video.video_id,) for video in report.filed],
+                [(video.video_id,) for video in changes.filed],
             )
             connection.executemany(
                 "UPDATE video SET warning_unreported = 0 WHERE video_id = ?",
-                [(video.video_id,) for video in report.videos],
+                [(video.video_id,) for video in changes.videos],
             )
             if active is not None:
                 connection.execute("DELETE FROM reported_warning")
