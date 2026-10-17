@@ -27,10 +27,14 @@ from youtube_helper.media_library import (
 )
 from youtube_helper.nfo import episode_nfo, tvshow_nfo
 from youtube_helper.notifications import (
+    LastingWarning,
     Mailer,
     MailError,
+    Report,
     failure_warning,
-    new_videos_notification,
+    feed_warning_key,
+    local_time,
+    notification,
     send_email,
 )
 from youtube_helper.state import (
@@ -143,19 +147,39 @@ class Cycle:
         log.info("Cycle finished")
 
     def _notify(self) -> None:
-        """Send the Notification of the videos filed since the last one delivered, if any.
+        """Send the Notification of what changed since the last one delivered, if anything did:
+        Warnings raised and cleared, and videos filed.
 
-        One that can't be sent is a Warning; its videos are reported by the next one delivered.
+        One that can't be sent is a Warning, but never reported itself; what it would have
+        reported is measured again against the last one delivered next time.
         """
         saved = self._state.email_settings()
-        if not saved.settings.reports_new_videos:
+        settings = saved.settings
+        if not (settings.reports_new_videos or settings.reports_warnings):
             self._state.clear_notification_failure()
             return
-        filed = self._state.unreported_videos()
-        if not filed:
+        report = Report(
+            filed=self._state.unreported_videos() if settings.reports_new_videos else ()
+        )
+        active = None
+        if settings.reports_warnings:
+            active = self._lasting_warnings()
+            reported = self._state.reported_warnings()
+            keys = {warning.key for warning in active}
+            report = replace(
+                report,
+                raised=[warning for warning in active if warning.key not in reported],
+                videos=self._state.unreported_video_warnings(),
+                cleared=[title for key, title in reported.items() if key not in keys],
+            )
+        if not report:
             return
-        failure = self._state.notification_failure()
-        subject, content = new_videos_notification(filed, failure, self._timezone)
+        subject, content = notification(
+            report,
+            self._state.notification_failure(),
+            self._timezone,
+            RETRY_PERIOD // timedelta(hours=1),
+        )
         try:
             send_email(
                 saved,
@@ -169,8 +193,67 @@ class Cycle:
             log.error("%s; trying again next cycle", warning)
             self._state.notification_failed(warning, self._clock())
             return
-        self._state.notification_delivered(video.video_id for video in filed)
-        log.info("Sent the Notification of %s to %s", subject, ", ".join(saved.settings.recipients))
+        self._state.notification_delivered(report, active)
+        log.info("Sent the Notification %r to %s", subject, ", ".join(settings.recipients))
+
+    def _lasting_warnings(self) -> list[LastingWarning]:
+        """The lasting Warnings the last cycle left active.
+
+        A Subscription's unreadable feed is one only once it has failed for RETRY_PERIOD.
+        """
+        outcome = self._state.last_cycle()
+        if outcome is None:
+            return []
+        warnings = []
+        if outcome.unwritable:
+            warnings.append(
+                LastingWarning(
+                    "unwritable",
+                    "Media library not writable",
+                    f"{outcome.unwritable}; cycles are skipped until it is writable again.",
+                )
+            )
+        if (failed := outcome.all_downloads_failed) is not None:
+            bot_checks = (
+                f" YouTube asked {failed.bot_checks} of them for a bot check. {BOT_CHECK_ADVICE}."
+                if failed.bot_checks
+                else ""
+            )
+            warnings.append(
+                LastingWarning(
+                    "all_downloads_failing",
+                    "All downloads failing",
+                    f"All downloads failing ({failed.attempts} in the last cycle that tried any,"
+                    f" last error: {failed.last_error}): yt-dlp is likely outdated, pull the"
+                    f" latest image.{bot_checks}",
+                )
+            )
+        if (low_space := outcome.low_space) is not None:
+            warnings.append(
+                LastingWarning(
+                    "low_space",
+                    "Low free space",
+                    f"Only {format_size(low_space.free)} free in the Media library, less than"
+                    f" {format_size(low_space.threshold)}: downloads are paused, New uploads stay"
+                    " pending until there is more room.",
+                )
+            )
+        now = self._clock()
+        failing_since = self._state.feeds_failing_since()
+        for subscription in self._state.tracked_subscriptions():
+            since = failing_since.get(subscription.channel_id)
+            if not subscription.active or since is None or now - since < RETRY_PERIOD:
+                continue
+            warnings.append(
+                LastingWarning(
+                    feed_warning_key(subscription.channel_id),
+                    f"Feed of {subscription.display_name} unreadable",
+                    f"The upload feed of {subscription.display_name} can't be read since"
+                    f" {local_time(since, self._timezone)}:"
+                    f" {outcome.feed_failures[subscription.channel_id]}",
+                )
+            )
+        return warnings
 
     def _low_space(self) -> LowSpace | None:
         """Why there is no room for the next download, logged; None if there is room."""

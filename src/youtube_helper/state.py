@@ -19,11 +19,15 @@ from youtube_helper.media_library import channel_folder
 from youtube_helper.notifications import (
     EmailSettings,
     FiledVideo,
+    LastingWarning,
     NotificationFailure,
     PasswordCipher,
     PasswordState,
+    Report,
     SavedEmailSettings,
     Security,
+    VideoWarning,
+    feed_warning_key,
 )
 from youtube_helper.upload_feed import Upload
 
@@ -104,6 +108,12 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     " id INTEGER PRIMARY KEY CHECK (id = 1),"
     " since TEXT NOT NULL,"
     " warning TEXT NOT NULL)",
+    "ALTER TABLE feed_failure ADD COLUMN since TEXT",
+    "UPDATE feed_failure SET since = (SELECT started FROM cycle_outcome)",
+    # Given up on or skipped, but not yet reported in a delivered Notification.
+    "ALTER TABLE video ADD COLUMN warning_unreported INTEGER NOT NULL DEFAULT 0",
+    # The lasting Warnings active as of the last delivered Notification.
+    "CREATE TABLE reported_warning (key TEXT PRIMARY KEY, title TEXT NOT NULL)",
 )
 
 # How long videos given up or skipped are still shown as problems.
@@ -298,6 +308,13 @@ class StateStore:
             connection.execute(
                 "UPDATE subscription SET active = 0 WHERE channel_id = ?", (channel_id,)
             )
+            # Its Warnings disappear silently: none is reported, not even as cleared.
+            connection.execute(
+                "UPDATE video SET warning_unreported = 0 WHERE channel_id = ?", (channel_id,)
+            )
+            connection.execute(
+                "DELETE FROM reported_warning WHERE key = ?", (feed_warning_key(channel_id),)
+            )
         return replace(_tracked(row), active=False)
 
     def refresh_details(self, channel: Channel, at: datetime) -> None:
@@ -376,8 +393,8 @@ class StateStore:
         """Remember that the video can never be downloaded, so it is never tried again."""
         with self._transaction() as connection:
             connection.execute(
-                "UPDATE video SET status = 'skipped', last_error = ?, gave_up = ?"
-                " WHERE video_id = ?",
+                "UPDATE video SET status = 'skipped', last_error = ?, gave_up = ?,"
+                " warning_unreported = 1 WHERE video_id = ?",
                 (error, _utc(at), video_id),
             )
 
@@ -395,7 +412,8 @@ class StateStore:
         """Remember that the video kept failing for too long, so it is never tried again."""
         with self._transaction() as connection:
             connection.execute(
-                "UPDATE video SET status = 'failed', gave_up = ? WHERE video_id = ?",
+                "UPDATE video SET status = 'failed', gave_up = ?, warning_unreported = 1"
+                " WHERE video_id = ?",
                 (_utc(at), video_id),
             )
 
@@ -439,7 +457,10 @@ class StateStore:
         return problems
 
     def record_cycle(self, outcome: CycleOutcome) -> None:
-        """Remember `outcome` as the last cycle's, in place of the one before."""
+        """Remember `outcome` as the last cycle's, in place of the one before.
+
+        A feed that failed before keeps failing since then; one failing anew since this cycle.
+        """
         failed = outcome.all_downloads_failed
         low_space = outcome.low_space
         with self._transaction() as connection:
@@ -460,11 +481,22 @@ class StateStore:
                     None if failed is None else failed.bot_checks,
                 ),
             )
+            since = dict(connection.execute("SELECT channel_id, since FROM feed_failure"))
             connection.execute("DELETE FROM feed_failure")
             connection.executemany(
-                "INSERT INTO feed_failure (channel_id, error) VALUES (?, ?)",
-                outcome.feed_failures.items(),
+                "INSERT INTO feed_failure (channel_id, error, since) VALUES (?, ?, ?)",
+                [
+                    (channel_id, error, since.get(channel_id) or _utc(outcome.started))
+                    for channel_id, error in outcome.feed_failures.items()
+                ],
             )
+
+    def feeds_failing_since(self) -> dict[str, datetime]:
+        """Since when each Subscription's feed that couldn't be read in the last cycle fails,
+        by channel ID."""
+        with self._transaction() as connection:
+            rows = connection.execute("SELECT channel_id, since FROM feed_failure").fetchall()
+        return {channel_id: datetime.fromisoformat(since) for channel_id, since in rows}
 
     def last_cycle(self) -> CycleOutcome | None:
         """The outcome of the last cycle, or None if none has run yet."""
@@ -504,14 +536,50 @@ class StateStore:
             for video_id, channel_id, subscription, title, released in rows
         ]
 
-    def notification_delivered(self, video_ids: Iterable[str]) -> None:
-        """Remember that a Notification reporting these videos was delivered: Notifications
-        work again."""
+    def unreported_video_warnings(self) -> list[VideoWarning]:
+        """The videos given up on or skipped and not reported yet, by Subscription in the order
+        first made, oldest first."""
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT video_id, display_name, title, status, last_error"
+                " FROM video JOIN subscription USING (channel_id)"
+                " WHERE warning_unreported ORDER BY subscription.rowid, released"
+            ).fetchall()
+        return [
+            VideoWarning(video_id, subscription, title, status == "failed", error or "")
+            for video_id, subscription, title, status, error in rows
+        ]
+
+    def reported_warnings(self) -> dict[str, str]:
+        """The titles of the lasting Warnings active as of the last delivered Notification, by
+        key, in the order raised."""
+        with self._transaction() as connection:
+            return dict(
+                connection.execute("SELECT key, title FROM reported_warning ORDER BY rowid")
+            )
+
+    def notification_delivered(
+        self, report: Report, active: Iterable[LastingWarning] | None = None
+    ) -> None:
+        """Remember that a Notification of `report` was delivered: Notifications work again.
+
+        `active` are the lasting Warnings active as of it, None if it doesn't report Warnings.
+        """
         with self._transaction() as connection:
             connection.executemany(
                 "UPDATE video SET unreported = 0 WHERE video_id = ?",
-                [(video_id,) for video_id in video_ids],
+                [(video.video_id,) for video in report.filed],
             )
+            connection.executemany(
+                "UPDATE video SET warning_unreported = 0 WHERE video_id = ?",
+                [(video.video_id,) for video in report.videos],
+            )
+            if active is not None:
+                connection.execute("DELETE FROM reported_warning")
+                connection.executemany(
+                    "INSERT INTO reported_warning (key, title) VALUES (?, ?)",
+                    [(warning.key, warning.title) for warning in active],
+                )
             connection.execute("DELETE FROM notification_failure")
 
     def notification_failed(self, warning: str, at: datetime) -> None:
@@ -564,7 +632,9 @@ class StateStore:
 
         The stored password is dropped when the host, port, security or username change: the
         tool decrypts it to send it, so it must not follow the settings to someone else's server.
-        Switching on Notifications of new videos counts every video filed so far as reported.
+        Switching on Notifications of new videos counts every video filed so far as reported;
+        switching on those of Warnings, every video given up on so far, while the lasting
+        Warnings active then are reported as raised.
         """
         if password is not None and self._cipher is None:
             raise ValueError("No secret key to encrypt the SMTP password with")
@@ -578,6 +648,9 @@ class StateStore:
             if settings.reports_new_videos and not stored.reports_new_videos:
                 connection.execute("UPDATE video SET unreported = 0")
                 connection.execute("DELETE FROM notification_failure")
+            if settings.reports_warnings and not stored.reports_warnings:
+                connection.execute("UPDATE video SET warning_unreported = 0")
+                connection.execute("DELETE FROM reported_warning")
             if password is not None and self._cipher is not None:
                 token = self._cipher.encrypt(password)
             connection.execute(

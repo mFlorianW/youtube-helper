@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 """Email Notifications: their settings, the SMTP password's encryption, the test email and the
-Notifications of new videos."""
+Notifications of Warnings and new videos."""
 
 import base64
 import hashlib
@@ -55,6 +55,11 @@ class EmailSettings:
     def reports_new_videos(self) -> bool:
         """Whether Notifications report the videos filed into the Media library."""
         return self.enabled and self.new_videos
+
+    @property
+    def reports_warnings(self) -> bool:
+        """Whether Notifications report Warnings raised and cleared."""
+        return self.enabled and self.warnings
 
     def same_server(self, other: EmailSettings) -> bool:
         """Whether `other` logs into the same server as the same user: the password still fits."""
@@ -286,30 +291,112 @@ def failure_warning(error: MailError) -> str:
     return f"Email can't be sent: {error}"
 
 
-def new_videos_notification(
-    filed: Sequence[FiledVideo], failure: NotificationFailure | None, timezone: ZoneInfo
+@dataclass(frozen=True)
+class LastingWarning:
+    """A Warning that lasts until a later Cycle no longer finds it.
+
+    `key` tells it apart from the others, `title` names it in a subject and once it is cleared,
+    and `detail` says what is wrong and what to do.
+    """
+
+    key: str
+    title: str
+    detail: str
+
+
+def feed_warning_key(channel_id: str) -> str:
+    """The key of the Warning that the Subscription's upload feed can't be read."""
+    return f"feed_unreadable:{channel_id}"
+
+
+@dataclass(frozen=True)
+class VideoWarning:
+    """A video given up on after failing for too long, or skipped for good: reported once."""
+
+    video_id: str
+    subscription: str
+    title: str
+    gave_up: bool
+    error: str
+
+    @property
+    def short(self) -> str:
+        return f"{'Gave up on' if self.gave_up else 'Skipped'} {self.title}"
+
+
+@dataclass(frozen=True)
+class Report:
+    """What a Notification reports: Warnings raised since the last one delivered, the titles of
+    those cleared since, and the videos filed since."""
+
+    raised: Sequence[LastingWarning] = ()
+    videos: Sequence[VideoWarning] = ()
+    cleared: Sequence[str] = ()
+    filed: Sequence[FiledVideo] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.raised or self.videos or self.cleared or self.filed)
+
+
+def local_time(moment: datetime, timezone: ZoneInfo) -> str:
+    return moment.astimezone(timezone).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def notification(
+    report: Report, failure: NotificationFailure | None, timezone: ZoneInfo, retry_hours: int
 ) -> tuple[str, str]:
-    """The subject and plain text of the Notification reporting `filed`, grouped by Subscription
-    in the order given.
+    """The subject and plain text of the Notification of `report`: raised Warnings, then cleared
+    ones, then the filed videos, grouped by Subscription in the order given.
 
     After a failure, it says since when Notifications were failing.
     """
-    count = f"{len(filed)} new video{'' if len(filed) == 1 else 's'}"
+    subject = []
     lines = []
     if failure is not None:
-        since = failure.since.astimezone(timezone).strftime("%Y-%m-%d %H:%M %Z")
         lines += [
-            f"Notifications were failing since {since}; this one covers everything since then.",
+            f"Notifications were failing since {local_time(failure.since, timezone)};"
+            " this one covers everything since then.",
             "",
         ]
-    lines.append(f"{count} {'was' if len(filed) == 1 else 'were'} filed into the Media library.")
-    for _, group in groupby(filed, key=lambda video: video.channel_id):
-        videos = list(group)
-        lines += ["", videos[0].subscription, ""]
-        for video in videos:
-            aired = video.released.astimezone(timezone).date().isoformat()
+    raised = [w.title for w in report.raised] + [v.short for v in report.videos]
+    if raised:
+        others = len(raised) - 1
+        subject.append(
+            f"⚠ {raised[0]}"
+            + (f" and {others} more Warning{'' if others == 1 else 's'}" if others else "")
+        )
+        lines += ["⚠ Raised", ""]
+        lines += [f"- {warning.detail}" for warning in report.raised]
+        for warned in report.videos:
+            how = f"after failing for {retry_hours} hours" if warned.gave_up else "for good"
             lines += [
-                f"- {video.title} (aired {aired})",
-                f"  https://www.youtube.com/watch?v={video.video_id}",
+                f"- {warned.short} ({warned.subscription}) {how}: {warned.error}",
+                f"  {_youtube_link(warned.video_id)}",
             ]
-    return f"youtube-helper: {count}", "\n".join(lines) + "\n"
+        lines.append("")
+    if report.cleared:
+        count = len(report.cleared)
+        subject.append(
+            f"{report.cleared[0]} cleared" if count == 1 else f"{count} Warnings cleared"
+        )
+        lines += ["✓ Cleared", ""]
+        lines += [f"- {title}" for title in report.cleared]
+        lines.append("")
+    if filed := report.filed:
+        count_videos = f"{len(filed)} new video{'' if len(filed) == 1 else 's'}"
+        subject.append(count_videos)
+        lines.append(
+            f"{count_videos} {'was' if len(filed) == 1 else 'were'} filed into the Media library."
+        )
+        for _, group in groupby(filed, key=lambda video: video.channel_id):
+            videos = list(group)
+            lines += ["", videos[0].subscription, ""]
+            for video in videos:
+                aired = video.released.astimezone(timezone).date().isoformat()
+                lines += [f"- {video.title} (aired {aired})", f"  {_youtube_link(video.video_id)}"]
+        lines.append("")
+    return f"youtube-helper: {', '.join(subject)}", "\n".join(lines[:-1]) + "\n"
+
+
+def _youtube_link(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
