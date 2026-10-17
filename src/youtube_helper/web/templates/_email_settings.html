@@ -1,0 +1,88 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+<form id="email-settings" method="post" action="/notifications"
+      hx-post="/notifications" hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button">
+  {% if errors %}
+  <ul class="notice error" role="alert">
+    {% for error in errors %}<li>{{ error }}</li>{% endfor %}
+  </ul>
+  {% elif saved %}
+  <p class="notice success" role="status">Saved.</p>
+  {% endif %}
+  <fieldset>
+    <label>
+      <input type="checkbox" role="switch" name="enabled"{% if form.enabled %} checked{% endif %}>
+      Email Notifications
+    </label>
+    <label>
+      <input type="checkbox" name="new_videos"{% if form.new_videos %} checked{% endif %}>
+      New videos filed into the Media library
+    </label>
+    <label>
+      <input type="checkbox" name="warnings"{% if form.warnings %} checked{% endif %}>
+      Warnings raised or cleared
+    </label>
+  </fieldset>
+  <h3>SMTP server</h3>
+  <div class="grid">
+    <label>Host
+      <input name="host" value="{{ form.host }}" autocomplete="off" placeholder="smtp.example.org">
+    </label>
+    <label>Security
+      <select name="security">
+        {% for value, label, port in securities %}
+        <option value="{{ value }}" data-port="{{ port }}"{% if form.security == value %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Port
+      <input name="port" value="{{ form.port }}" inputmode="numeric" autocomplete="off">
+    </label>
+  </div>
+  <div class="grid">
+    <label>Username <small>(optional)</small>
+      <input name="username" value="{{ form.username }}" autocomplete="off">
+    </label>
+    <label>Password <small>(optional)</small>
+      {# Write-only: the stored password is never sent back to the browser. #}
+      <input type="password" name="password" autocomplete="new-password"
+             {% if not can_store_password %}disabled{% endif %}
+             placeholder="{{ 'Leave blank to keep the stored password' if password_state == 'set' else '' }}">
+      <small>
+        {% if not can_store_password %}
+        Set <code>SECRET_KEY_FILE</code> to store a password; until then only servers that need no login work.
+        {% elif password_state == "set" %}
+        A password is set. Changing the host, port, security or username clears it.
+        {% elif password_state == "unreadable" %}
+        <span class="notice error">The stored password can't be decrypted with the current secret key; please enter it again.</span>
+        {% else %}
+        No password set.
+        {% endif %}
+      </small>
+    </label>
+  </div>
+  <label>From address
+    <input name="from_address" value="{{ form.from_address }}" autocomplete="off" placeholder="youtube-helper@example.org">
+  </label>
+  <label>Recipients
+    <textarea name="recipients" rows="2" placeholder="One address per line">{{ form.recipients }}</textarea>
+  </label>
+  <button type="submit">Save</button>
+  <script>
+    // Follow the security setting with its usual port, unless a custom port was entered.
+    (() => {
+      const form = document.currentScript.closest("form");
+      const port = form.elements.port;
+      form.elements.security.addEventListener("change", (event) => {
+        const defaults = [...event.target.options].map((option) => option.dataset.port);
+        if (port.value === "" || defaults.includes(port.value)) {
+          port.value = event.target.selectedOptions[0].dataset.port;
+        }
+      });
+    })();
+  </script>
+</form>

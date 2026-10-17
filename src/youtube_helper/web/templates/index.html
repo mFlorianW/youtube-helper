@@ -4,25 +4,9 @@ SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
 SPDX-License-Identifier: GPL-2.0-only
 #}
 
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light dark">
-    <title>youtube-helper</title>
-    <link rel="stylesheet" href="/static/pico.min.css">
-    <link rel="stylesheet" href="/static/app.css">
-    <script src="/static/htmx.min.js" defer></script>
-  </head>
-  <body>
-    <header class="container">
-      <hgroup>
-        <h1>youtube-helper</h1>
-        <p>Keeps the Media library stocked with New uploads from your Subscriptions.</p>
-      </hgroup>
-    </header>
-    <main class="container">
+{% extends "base.html" %}
+
+{% block main %}
       <article id="status" hx-get="/status" hx-trigger="every 30s">{% include "_status.html" %}</article>
       <article>
         <header><h2>Add a channel</h2></header>
@@ -39,6 +23,4 @@ SPDX-License-Identifier: GPL-2.0-only
         <div id="preview" aria-live="polite">{% include "_preview.html" %}</div>
       </article>
       <section id="subscriptions">{% include "_subscriptions.html" %}</section>
-    </main>
-  </body>
-</html>
+{% endblock %}

@@ -23,6 +23,8 @@ class Config:
     state_dir: Path
     timezone: ZoneInfo
     web_port: int
+    # The deployment's secret the SMTP password is encrypted with; None if there is none.
+    secret_key: bytes | None = None
 
 
 def load_config(environ: Mapping[str, str]) -> Config:
@@ -35,7 +37,9 @@ def load_config(environ: Mapping[str, str]) -> Config:
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise ConfigError(f"TZ {timezone_name!r} is not a known time zone") from error
     state_dir = Path(environ.get("STATE_DIR") or DEFAULT_STATE_DIR)
-    return Config(Path(media_library), state_dir, timezone, _web_port(environ))
+    return Config(
+        Path(media_library), state_dir, timezone, _web_port(environ), _secret_key(environ)
+    )
 
 
 def _web_port(environ: Mapping[str, str]) -> int:
@@ -43,3 +47,16 @@ def _web_port(environ: Mapping[str, str]) -> int:
     if not value.isdigit() or not 1 <= int(value) <= 65535:
         raise ConfigError(f"WEB_PORT {value!r} is not a port number (1-65535)")
     return int(value)
+
+
+def _secret_key(environ: Mapping[str, str]) -> bytes | None:
+    path = environ.get("SECRET_KEY_FILE")
+    if not path:
+        return None
+    try:
+        secret = Path(path).read_bytes().strip()
+    except OSError as error:
+        raise ConfigError(f"SECRET_KEY_FILE {path} can't be read: {error.strerror}") from error
+    if not secret:
+        raise ConfigError(f"SECRET_KEY_FILE {path} is empty")
+    return secret

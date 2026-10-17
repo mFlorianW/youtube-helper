@@ -1,0 +1,25 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+{% extends "base.html" %}
+
+{% block title %}Notifications · {% endblock %}
+
+{% block main %}
+      <article>
+        <header><h2>Email Notifications</h2></header>
+        {% include "_email_settings.html" %}
+      </article>
+      <article>
+        <header><h2>Test email</h2></header>
+        <form method="post" action="/notifications/test"
+              hx-post="/notifications/test" hx-target="#test-result" hx-disabled-elt="find button">
+          <button type="submit" class="secondary">Send test email</button>
+          <small>Sends right away with the saved settings, so save your changes first.</small>
+        </form>
+        <div id="test-result" aria-live="polite">{% include "_test_email.html" %}</div>
+      </article>
+{% endblock %}

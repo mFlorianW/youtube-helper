@@ -16,6 +16,13 @@ from typing import Any, Literal, Self
 
 from youtube_helper.channels import Channel
 from youtube_helper.media_library import channel_folder
+from youtube_helper.notifications import (
+    EmailSettings,
+    PasswordCipher,
+    PasswordState,
+    SavedEmailSettings,
+    Security,
+)
 from youtube_helper.upload_feed import Upload
 
 DATABASE_NAME = "youtube-helper.sqlite3"
@@ -77,6 +84,18 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     " last_download_error TEXT,"
     " bot_checks INTEGER)",
     "CREATE TABLE feed_failure (channel_id TEXT PRIMARY KEY, error TEXT NOT NULL)",
+    "CREATE TABLE email_settings ("
+    " id INTEGER PRIMARY KEY CHECK (id = 1),"
+    " enabled INTEGER NOT NULL,"
+    " new_videos INTEGER NOT NULL,"
+    " warnings INTEGER NOT NULL,"
+    " host TEXT NOT NULL,"
+    " port INTEGER NOT NULL,"
+    " security TEXT NOT NULL,"
+    " username TEXT NOT NULL,"
+    " password TEXT,"
+    " from_address TEXT NOT NULL,"
+    " recipients TEXT NOT NULL)",
 )
 
 # How long videos given up or skipped are still shown as problems.
@@ -169,8 +188,9 @@ class Subscribed(Enum):
 class StateStore:
     """Shared by the daemon's threads: each method runs alone, in a transaction of its own."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(self, connection: sqlite3.Connection, cipher: PasswordCipher | None) -> None:
         self._connection = connection
+        self._cipher = cipher
         self._lock = threading.Lock()
 
     @contextmanager
@@ -180,15 +200,18 @@ class StateStore:
             yield self._connection
 
     @classmethod
-    def open(cls, state_dir: Path) -> Self:
-        """Open the state database in `state_dir`, creating or upgrading it as needed."""
+    def open(cls, state_dir: Path, *, secret_key: bytes | None = None) -> Self:
+        """Open the state database in `state_dir`, creating or upgrading it as needed.
+
+        The SMTP password can only be stored and read with the deployment's `secret_key`.
+        """
         path = state_dir / DATABASE_NAME
         try:
             connection = sqlite3.connect(path, autocommit=False, check_same_thread=False)
             _migrate(connection)
         except sqlite3.Error as error:
             raise StateUnavailable(path, error) from error
-        return cls(connection)
+        return cls(connection, None if secret_key is None else PasswordCipher(secret_key))
 
     def close(self) -> None:
         self._connection.close()
@@ -454,6 +477,82 @@ class StateStore:
             None if attempts is None else AllDownloadsFailed(attempts, error, bot_checks),
             feed_failures,
         )
+
+    @property
+    def can_store_password(self) -> bool:
+        """Whether there is a key to encrypt the SMTP password with."""
+        return self._cipher is not None
+
+    def email_settings(self) -> SavedEmailSettings:
+        """The email settings last saved, or the defaults if none were."""
+        with self._transaction() as connection:
+            row = connection.execute(_SELECT_EMAIL_SETTINGS).fetchone()
+        if row is None:
+            return SavedEmailSettings(EmailSettings())
+        settings, token = _email_settings(row)
+        if token is None:
+            return SavedEmailSettings(settings)
+        password = None if self._cipher is None else self._cipher.decrypt(token)
+        if password is None:
+            return SavedEmailSettings(settings, PasswordState.UNREADABLE)
+        return SavedEmailSettings(settings, PasswordState.SET, password)
+
+    def save_email_settings(self, settings: EmailSettings, password: str | None = None) -> None:
+        """Remember `settings`, with `password` if given, or else with the stored password.
+
+        The stored password is dropped when the host, port, security or username change: the
+        tool decrypts it to send it, so it must not follow the settings to someone else's server.
+        """
+        if password is not None and self._cipher is None:
+            raise ValueError("No secret key to encrypt the SMTP password with")
+        with self._transaction() as connection:
+            token = None
+            if row := connection.execute(_SELECT_EMAIL_SETTINGS).fetchone():
+                stored, stored_token = _email_settings(row)
+                if stored.same_server(settings):
+                    token = stored_token
+            if password is not None and self._cipher is not None:
+                token = self._cipher.encrypt(password)
+            connection.execute(
+                "INSERT OR REPLACE INTO email_settings"
+                " (id, enabled, new_videos, warnings, host, port, security, username, password,"
+                " from_address, recipients) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    settings.enabled,
+                    settings.new_videos,
+                    settings.warnings,
+                    settings.host,
+                    settings.port,
+                    settings.security.value,
+                    settings.username,
+                    token,
+                    settings.from_address,
+                    "\n".join(settings.recipients),
+                ),
+            )
+
+
+_SELECT_EMAIL_SETTINGS = (
+    "SELECT enabled, new_videos, warnings, host, port, security, username, password,"
+    " from_address, recipients FROM email_settings"
+)
+
+
+def _email_settings(row: tuple[Any, ...]) -> tuple[EmailSettings, str | None]:
+    """The settings and the encrypted password in a row selected with _SELECT_EMAIL_SETTINGS."""
+    enabled, new_videos, warnings, host, port, security, username, token, sender, recipients = row
+    settings = EmailSettings(
+        bool(enabled),
+        bool(new_videos),
+        bool(warnings),
+        host,
+        port,
+        Security(security),
+        username,
+        sender,
+        tuple(recipients.split("\n")) if recipients else (),
+    )
+    return settings, token
 
 
 _SELECT_SUBSCRIPTION = (

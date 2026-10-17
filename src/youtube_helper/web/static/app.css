@@ -35,6 +35,22 @@ h2 {
   color: var(--pico-del-color);
 }
 
+.notice.success {
+  color: var(--pico-ins-color);
+}
+
+ul.notice {
+  padding-left: 1.1rem;
+}
+
+body > header nav {
+  border-bottom: 1px solid var(--pico-muted-border-color);
+}
+
+h3 {
+  font-size: 1.05rem;
+}
+
 .channels {
   padding: 0;
 }

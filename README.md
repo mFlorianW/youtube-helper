@@ -67,7 +67,8 @@ authentication in front of it if you expose it any further.
 To add a channel, paste its `@handle`, its channel URL or the URL of any of its videos and click
 **Look up**. youtube-helper looks the channel up on YouTube and shows its avatar and name;
 **Subscribe** adds it. **Remove** next to a Subscription removes it again. These are the only
-actions; everything else on the page is information.
+actions on the Subscriptions page; everything else there is information. The
+[Notifications](#notifications) page, linked from the header, holds the email settings.
 
 ### Status
 
@@ -90,6 +91,45 @@ Each Subscription lists its own problems:
 
 Videos excluded on purpose (Shorts, livestreams) are not shown. The status is kept in the state
 database, so it survives restarts.
+
+## Notifications
+
+The **Notifications** page of the web UI holds all email settings; none of them are set in the
+deployment. They are kept in the state database. Notifications themselves aren't sent yet:
+for now the page only stores the settings and sends a test email.
+
+- **Email Notifications** switches them on or off; off by default. **New videos** and
+  **Warnings** choose what they report; both are ticked by default.
+- **SMTP server**: host, security (STARTTLS, implicit TLS or none) and port. A blank port is
+  the usual one for the security setting: 587, 465 or 25. With STARTTLS and implicit TLS the
+  server's certificate is verified.
+- **Username** and **password**, both optional: leave them blank for a relay that needs no
+  login. Security "none" is refused together with either, as it would send them unencrypted.
+- **From address** and one or more **recipients**, one per line.
+
+Saving checks that the addresses are well-formed and, while Email Notifications are switched
+on, that a host, a From address and a recipient are set. **Send test email** sends one right
+away with the saved settings and shows the result or the SMTP server's error.
+
+### The SMTP password
+
+The password field is write-only: the page only says whether a password is set, and leaving the
+field blank keeps the stored one. Changing the host, port, security or username clears it, so
+that nobody can point the tool at their own server and receive the password; enter it again
+with the new settings.
+
+The password is stored in the state database encrypted (Fernet) under a key derived from the
+secret in `SECRET_KEY_FILE`, ideally a Docker secret (see the examples). A copy of `/state`,
+e.g. a backup, thus doesn't reveal the password; a copy together with the secret does, and
+so does anyone who can read the secret inside the running container. The tool has to decrypt
+the password to log in, so the encryption can't protect it from the host itself. Use an
+app-specific password or a relay's password rather than your main mailbox password.
+
+Generate the secret once and keep it, e.g. with `openssl rand -base64 32 > secret_key`.
+Without `SECRET_KEY_FILE` the daemon still starts: the password field is disabled, and email
+works only with servers that need no login. If the secret changes, or `/state` is restored on a
+deployment with another secret, the stored password can't be decrypted any more: the page says
+so and asks for it again.
 
 ## Subscriptions
 
@@ -176,7 +216,8 @@ with its videos in release order, without any plugin:
 
 ## Configuration
 
-All configuration is passed to the container by Compose. There is no config file.
+All configuration is passed to the container by Compose. There is no config file. The email
+settings are the exception: they are made in the web UI (see [Notifications](#notifications)).
 
 | Setting                        | Kind                 | Default  | Meaning                                                                                                           |
 | ------------------------------ | -------------------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
@@ -184,12 +225,14 @@ All configuration is passed to the container by Compose. There is no config file
 | `STATE_DIR`                    | environment          | `/state` | Directory holding the SQLite state database `youtube-helper.sqlite3`. Mount a host directory there and back it up. |
 | `TZ`                           | environment          | `UTC`    | IANA time zone, e.g. `Europe/Berlin`. Used for log times, release times and the web UI. An unknown name stops the daemon. |
 | `WEB_PORT`                     | environment          | `8080`   | Port of the web UI inside the container. Publish it with `ports:`. A taken or invalid port stops the daemon.      |
+| `SECRET_KEY_FILE`              | environment          | none     | File holding the secret the SMTP password is encrypted with, e.g. `/run/secrets/secret_key`. See [The SMTP password](#the-smtp-password). Set but unreadable or empty, it stops the daemon. |
 | `user`                         | Compose service key  | root     | UID:GID the tool runs as. It must be able to write the Media library and state directory.                         |
 
 The daemon checks that the Media library is writable at startup and before every cycle. If it
 isn't, the daemon logs an error naming the directory, skips the cycle and tries again 30 minutes
 later; it keeps running, and the web UI shows the problem. A missing `MEDIA_LIBRARY`, an unknown
-`TZ` or a state database that can't be opened stop the daemon at startup. youtube-helper never
+`TZ`, an unreadable `SECRET_KEY_FILE` or a state database that can't be opened stop the daemon
+at startup. youtube-helper never
 changes ownership or permissions; setting them up is the admin's job.
 
 ## Development
