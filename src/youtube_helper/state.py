@@ -540,17 +540,28 @@ _SELECT_EMAIL_SETTINGS = (
 
 def _email_settings(row: tuple[Any, ...]) -> tuple[EmailSettings, str | None]:
     """The settings and the encrypted password in a row selected with _SELECT_EMAIL_SETTINGS."""
-    enabled, new_videos, warnings, host, port, security, username, token, sender, recipients = row
-    settings = EmailSettings(
-        bool(enabled),
-        bool(new_videos),
-        bool(warnings),
+    (
+        enabled,
+        new_videos,
+        warnings,
         host,
         port,
-        Security(security),
+        security,
         username,
-        sender,
-        tuple(recipients.split("\n")) if recipients else (),
+        token,
+        from_address,
+        recipients,
+    ) = row
+    settings = EmailSettings(
+        enabled=bool(enabled),
+        new_videos=bool(new_videos),
+        warnings=bool(warnings),
+        host=host,
+        port=port,
+        security=Security(security),
+        username=username,
+        from_address=from_address,
+        recipients=tuple(recipients.split("\n")) if recipients else (),
     )
     return settings, token
 

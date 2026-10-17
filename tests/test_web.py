@@ -581,6 +581,7 @@ def test_saving_with_htmx_sends_only_the_form(client: TestClient) -> None:
         ({"port": "smtp"}, "Port smtp is not a port number (1-65535)"),
         ({"port": "70000"}, "Port 70000 is not a port number (1-65535)"),
         ({"security": "ssl"}, "Choose a security setting"),
+        ({"username": ""}, "A password is only used with a username"),
         ({"host": ""}, "Email Notifications need an SMTP host, a From address and a recipient"),
         (
             {"recipients": ""},
@@ -721,3 +722,16 @@ def test_test_email_without_htmx_shows_the_whole_page(client: TestClient) -> Non
 
     assert "<html" in response.text
     assert "Test email sent" in response.text
+
+
+def test_test_email_after_the_secret_key_was_removed_asks_for_it(
+    client: TestClient, state_dir: Path, mailer: FakeMailer
+) -> None:
+    save_email(client)
+
+    with closing(StateStore.open(state_dir)) as keyless:
+        html = send_test_email(app_on(keyless, mailer))
+
+    assert "Set SECRET_KEY_FILE to use the stored password" in html
+    assert "enter it again" not in html
+    assert mailer.sent == []

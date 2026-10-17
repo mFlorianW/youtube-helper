@@ -104,7 +104,8 @@ for now the page only stores the settings and sends a test email.
   the usual one for the security setting: 587, 465 or 25. With STARTTLS and implicit TLS the
   server's certificate is verified.
 - **Username** and **password**, both optional: leave them blank for a relay that needs no
-  login. Security "none" is refused together with either, as it would send them unencrypted.
+  login; a password needs a username. Security "none" is refused together with either, as it
+  would send them unencrypted.
 - **From address** and one or more **recipients**, one per line.
 
 Saving checks that the addresses are well-formed and, while Email Notifications are switched

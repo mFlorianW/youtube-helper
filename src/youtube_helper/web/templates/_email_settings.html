@@ -58,7 +58,7 @@ SPDX-License-Identifier: GPL-2.0-only
         {% elif password_state == "set" %}
         A password is set. Changing the host, port, security or username clears it.
         {% elif password_state == "unreadable" %}
-        <span class="notice error">The stored password can't be decrypted with the current secret key; please enter it again.</span>
+        <span class="notice error">{{ unreadable_password }}.</span>
         {% else %}
         No password set.
         {% endif %}

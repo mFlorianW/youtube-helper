@@ -42,6 +42,11 @@ class EmailSettings:
     from_address: str = ""
     recipients: tuple[str, ...] = ()
 
+    @property
+    def complete(self) -> bool:
+        """Whether there is a server to send over, a sender and someone to send to."""
+        return bool(self.host and self.from_address and self.recipients)
+
     def same_server(self, other: EmailSettings) -> bool:
         """Whether `other` logs into the same server as the same user: the password still fits."""
         return (self.host, self.port, self.security, self.username) == (
@@ -66,6 +71,11 @@ class SavedEmailSettings:
     settings: EmailSettings
     password_state: PasswordState = PasswordState.UNSET
     password: str | None = None
+
+
+UNREADABLE_PASSWORD = (
+    "The stored password can't be decrypted with the current secret key; please enter it again"
+)
 
 
 @dataclass(frozen=True)
@@ -113,6 +123,8 @@ def read_email_form(form: Mapping[str, str], *, can_store_password: bool) -> Ema
     password = form.get("password") or None
     if password and not can_store_password:
         errors.append("Set SECRET_KEY_FILE to store a password")
+    if password and not settings.username:
+        errors.append("A password is only used with a username; enter the username too")
     if settings.from_address and not ADDRESS.fullmatch(settings.from_address):
         errors.append(f"From address {settings.from_address} is not an email address")
     errors.extend(
@@ -120,7 +132,7 @@ def read_email_form(form: Mapping[str, str], *, can_store_password: bool) -> Ema
         for recipient in settings.recipients
         if not ADDRESS.fullmatch(recipient)
     )
-    if settings.enabled and not (settings.host and settings.from_address and settings.recipients):
+    if settings.enabled and not settings.complete:
         errors.append("Email Notifications need an SMTP host, a From address and a recipient")
     if security is Security.NONE and (settings.username or password):
         errors.append(
@@ -190,19 +202,18 @@ class SmtpMailer:
             raise MailError(str(error) or type(error).__name__) from error
 
 
-def send_test_email(saved: SavedEmailSettings, mailer: Mailer) -> str:
+def send_test_email(saved: SavedEmailSettings, mailer: Mailer, *, can_store_password: bool) -> str:
     """Send a test email with the saved settings; return what to tell the owner.
 
     Raises MailError if it can't be sent, also when the settings aren't complete enough to try.
     """
     settings = saved.settings
-    if not (settings.host and settings.from_address and settings.recipients):
+    if not settings.complete:
         raise MailError("Save an SMTP host, a From address and a recipient first")
     if saved.password_state is PasswordState.UNREADABLE:
-        raise MailError(
-            "The stored password can't be decrypted with the current secret key;"
-            " please enter it again"
-        )
+        if not can_store_password:
+            raise MailError("Set SECRET_KEY_FILE to use the stored password")
+        raise MailError(UNREADABLE_PASSWORD)
     message = EmailMessage()
     message["Subject"] = "youtube-helper: test email"
     message["From"] = settings.from_address

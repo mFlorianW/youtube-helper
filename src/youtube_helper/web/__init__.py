@@ -12,6 +12,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,7 @@ from starlette.templating import Jinja2Templates
 from youtube_helper.channels import Channel, ChannelResolver, ChannelUnavailable, NotAChannel
 from youtube_helper.cycle import BOT_CHECK_ADVICE, RETRY_PERIOD, format_size
 from youtube_helper.notifications import (
+    UNREADABLE_PASSWORD,
     EmailSettings,
     Mailer,
     MailError,
@@ -59,6 +61,7 @@ def create_app(
     templates.env.filters["size"] = format_size
     templates.env.globals["bot_check_advice"] = BOT_CHECK_ADVICE
     templates.env.globals["retry_hours"] = RETRY_PERIOD // timedelta(hours=1)
+    templates.env.globals["unreadable_password"] = UNREADABLE_PASSWORD
     previews: OrderedDict[str, Channel] = OrderedDict()
 
     # The state store blocks while a cycle uses it, so it is only ever called off the event loop.
@@ -198,7 +201,11 @@ def create_app(
         saved = await run_in_threadpool(state.email_settings)
         sent = error = None
         try:
-            sent = await run_in_threadpool(send_test_email, saved, mailer)
+            sent = await run_in_threadpool(
+                partial(send_test_email, can_store_password=state.can_store_password),
+                saved,
+                mailer,
+            )
         except MailError as failure:
             error = f"Couldn't send the test email: {failure}"
         else:
