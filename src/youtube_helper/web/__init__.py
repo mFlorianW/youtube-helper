@@ -46,52 +46,67 @@ def create_app(
     )
     previews: OrderedDict[str, Channel] = OrderedDict()
 
+    # The state store blocks while a cycle uses it, so it is only ever called off the event loop.
     def active() -> list[TrackedSubscription]:
         return [s for s in state.tracked_subscriptions() if s.active]
 
-    def render(request: Request, template: str, **context: object) -> Response:
-        return templates.TemplateResponse(request, template, {"subscriptions": active(), **context})
+    async def render(request: Request, template: str, **context: object) -> Response:
+        subscriptions = await run_in_threadpool(active)
+        return templates.TemplateResponse(
+            request, template, {"subscriptions": subscriptions, **context}
+        )
 
     def is_htmx(request: Request) -> bool:
         return request.headers.get("HX-Request") == "true"
 
-    def back_to_the_page(request: Request) -> Response:
+    async def look_up(reference: str) -> Channel | str:
+        """The channel `reference` leads to, or what to tell the owner if there is none."""
+        try:
+            return await run_in_threadpool(resolver.resolve, reference)
+        except NotAChannel:
+            return f"No YouTube channel found for {reference}"
+        except ChannelUnavailable as error:
+            return f"Can't reach YouTube right now ({error}); please try again"
+
+    async def back_to_the_page(request: Request) -> Response:
         """The updated list for htmx, otherwise the whole page again (POST-redirect-GET)."""
         if is_htmx(request):
-            return render(request, "_subscriptions_swap.html")
+            return await render(request, "_subscriptions_swap.html")
         return RedirectResponse("/", status_code=303)
 
     async def index(request: Request) -> Response:
-        return render(request, "index.html")
+        return await render(request, "index.html")
 
     async def preview(request: Request) -> Response:
         reference = str((await request.form()).get("channel", "")).strip()
         context: dict[str, object] = {"reference": reference}
-        try:
-            channel = await run_in_threadpool(resolver.resolve, reference)
-        except NotAChannel:
-            context["error"] = f"No YouTube channel found for {reference}"
-        except ChannelUnavailable as error:
-            context["error"] = f"Can't reach YouTube right now ({error}); please try again"
+        channel = await look_up(reference)
+        if isinstance(channel, str):
+            context["error"] = channel
         else:
             previews[channel.channel_id] = channel
             previews.move_to_end(channel.channel_id)
             while len(previews) > PREVIEWS_KEPT:
                 previews.popitem(last=False)
             context["channel"] = channel
-            context["already"] = any(s.channel_id == channel.channel_id for s in active())
-        return render(request, "_preview.html" if is_htmx(request) else "index.html", **context)
+            subscriptions = await run_in_threadpool(active)
+            context["already"] = any(s.channel_id == channel.channel_id for s in subscriptions)
+        return await render(
+            request, "_preview.html" if is_htmx(request) else "index.html", **context
+        )
 
     async def add(request: Request) -> Response:
         channel_id = str((await request.form()).get("channel_id", ""))
-        channel = previews.pop(channel_id, None)
-        if channel is None:
-            try:
-                channel = await run_in_threadpool(resolver.resolve, channel_id)
-            except (NotAChannel, ChannelUnavailable) as error:
-                return render(request, "index.html", error=str(error))
+        channel = previews.pop(channel_id, None) or await look_up(channel_id)
+        if isinstance(channel, str):
+            if not is_htmx(request):
+                return await render(request, "index.html", error=channel)
+            # The confirm button targets the list; the error belongs where the preview was.
+            response = await render(request, "_preview.html", error=channel)
+            response.headers["HX-Retarget"] = "#preview"
+            return response
         now = clock()
-        outcome, tracked = state.subscribe(channel, now)
+        outcome, tracked = await run_in_threadpool(state.subscribe, channel, now)
         if outcome is not Subscribed.ALREADY_ACTIVE:
             log.info(
                 "%s tracking %s (%s) from %s",
@@ -100,17 +115,17 @@ def create_app(
                 tracked.channel_id,
                 now.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC"),
             )
-        return back_to_the_page(request)
+        return await back_to_the_page(request)
 
     async def remove(request: Request) -> Response:
-        removed = state.unsubscribe(request.path_params["channel_id"])
+        removed = await run_in_threadpool(state.unsubscribe, request.path_params["channel_id"])
         if removed is not None:
             log.info(
                 "Stopped tracking %s (%s): unsubscribed; its files are kept",
                 removed.display_name,
                 removed.channel_id,
             )
-        return back_to_the_page(request)
+        return await back_to_the_page(request)
 
     return Starlette(
         routes=[

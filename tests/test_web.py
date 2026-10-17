@@ -234,6 +234,23 @@ def test_with_htmx_only_the_changed_parts_of_the_page_are_sent(client: TestClien
     assert "No Subscriptions yet" in removed
 
 
+def test_with_htmx_a_failed_lookup_on_confirming_shows_the_error_in_the_preview(
+    client: TestClient, resolver: FakeResolver
+) -> None:
+    resolver.references["UC1"] = ChannelUnavailable("HTTP Error 503")
+
+    response = client.post(
+        "/subscriptions", data={"channel_id": "UC1"}, headers={"HX-Request": "true"}
+    )
+
+    assert response.headers["HX-Retarget"] == "#preview"
+    assert "Can't reach YouTube right now (HTTP Error 503); please try again" in unescape(
+        response.text
+    )
+    assert "<html" not in response.text
+    assert subscriptions_on(page(client)) == []
+
+
 def test_page_serves_its_styles_and_scripts(client: TestClient) -> None:
     html = page(client)
 

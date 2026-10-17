@@ -5,6 +5,7 @@
 import logging
 import os
 import re
+import sqlite3
 import xml.etree.ElementTree as ET
 from contextlib import closing
 from dataclasses import replace
@@ -18,7 +19,7 @@ from youtube_helper.artwork import ArtworkUnavailable
 from youtube_helper.channels import Channel, ChannelUnavailable
 from youtube_helper.cycle import Cycle
 from youtube_helper.media_library import MediaLibraryUnwritable
-from youtube_helper.state import StateStore
+from youtube_helper.state import DATABASE_NAME, MIGRATIONS, StateStore
 from youtube_helper.upload_feed import FeedUnavailable, Upload
 from youtube_helper.video_fetcher import (
     BotCheck,
@@ -406,6 +407,56 @@ def test_channel_details_that_cannot_be_refreshed_keep_their_last_known_values(
     run_cycle(media_library, state, clock, resolver=resolver, feed=feed, fetcher=fetcher)
 
     assert nfo(media_library / "First Channel" / "tvshow.nfo")[1]["plot"] == "About First, revised"
+
+
+# The last schema with the owner's Google login. Released migrations never change, so applying
+# them reproduces a state file that version left behind.
+GOOGLE_SCHEMA_VERSION = 10
+
+
+def test_subscriptions_from_the_google_login_carry_on_after_upgrading(
+    media_library: Path,
+    state_dir: Path,
+    clock: FakeClock,
+    feed: FakeFeed,
+    fetcher: FakeFetcher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with closing(sqlite3.connect(state_dir / DATABASE_NAME, autocommit=True)) as old:
+        for migration in MIGRATIONS[:GOOGLE_SCHEMA_VERSION]:
+            if isinstance(migration, str):
+                old.execute(migration)
+            else:
+                migration(old)
+        old.execute(f"PRAGMA user_version = {GOOGLE_SCHEMA_VERSION}")
+        old.execute("INSERT INTO login VALUES (1, 'refresh-token')")
+        old.execute(
+            "INSERT INTO subscription (channel_id, display_name, active, tracking_start,"
+            " channel_folder, description, avatar_url) VALUES"
+            " ('UC1', 'First Channel', 1, '2026-10-16T12:00:00+00:00', 'First Channel',"
+            " 'About First', 'https://yt3.ggpht.com/UC1'),"
+            " ('UC2', 'Second Channel', 0, '2026-10-16T12:00:00+00:00', 'Second Channel', '', NULL)"
+        )
+        old.execute(
+            "INSERT INTO video (video_id, channel_id, title, released, status) VALUES"
+            " ('vid00000001', 'UC1', 'Downloaded', '2026-10-16T12:05:00+00:00', 'downloaded'),"
+            " ('vid00000002', 'UC1', 'Pending', '2026-10-16T12:10:00+00:00', 'pending')"
+        )
+        old.execute("INSERT INTO season VALUES ('UC1', 2026, 7)")
+    feed.publish("UC1", Upload("vid00000001", "Downloaded", START + timedelta(minutes=5)))
+    feed.publish("UC1", Upload("vid00000002", "Pending", START + timedelta(minutes=10)))
+    feed.publish("UC2", Upload("vid00000003", "Unsubscribed", START + timedelta(minutes=15)))
+    resolver = FakeResolver(FIRST, SECOND)
+    clock.advance()
+
+    with closing(StateStore.open(state_dir)) as state:
+        run_cycle(media_library, state, clock, resolver=resolver, feed=feed, fetcher=fetcher)
+
+    assert "Active Subscriptions (1): First Channel" in caplog.text
+    assert fetcher.fetched == ["vid00000002"]
+    assert episode_numbers(media_library) == {"vid00000002": ("2026", "8")}
+    # Never looked up by the tool itself: due right away.
+    assert resolver.resolved == ["UC1"]
 
 
 def test_new_upload_lands_in_its_channel_folder_named_by_release_time_in_local_time(

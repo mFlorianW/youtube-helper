@@ -29,6 +29,8 @@ HTTP_TIMEOUT = 30
 
 
 class WebUnavailable(Exception):
+    """The web UI can't listen on its port, e.g. because another service has it."""
+
     def __init__(self, port: int, reason: OSError) -> None:
         super().__init__(f"Can't serve the web UI on port {port}: {reason}")
 
