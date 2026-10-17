@@ -67,29 +67,48 @@ def test_daemon_runs_a_cycle_every_30_minutes(
     assert caplog.text.count("Cycle finished") == 2
 
 
-def test_daemon_exits_non_zero_when_media_library_is_unwritable_at_startup(
-    tmp_path: Path, state_dir: Path, caplog: pytest.LogCaptureFixture
+def test_daemon_with_unwritable_media_library_at_startup_skips_cycles_until_it_is_writable(
+    tmp_path: Path, state_dir: Path, serve: FakeServe, caplog: pytest.LogCaptureFixture
 ) -> None:
-    missing = tmp_path / "missing"
+    caplog.set_level(logging.INFO)
+    library = tmp_path / "library"
+    sleep = FakeSleep(stop_after=3)
 
-    status = run_daemon(environment(missing, state_dir), sleep=FakeSleep(stop_after=1))
+    def sleep_while_the_admin_fixes_it(seconds: float) -> None:
+        if len(sleep.durations) == 1:
+            library.mkdir()
+        sleep(seconds)
 
-    assert status != 0
-    assert f"Media library {missing} is not writable" in caplog.text
-    assert "Cycle started" not in caplog.text
+    with pytest.raises(StopDaemon):
+        run_daemon(environment(library, state_dir), sleep=sleep_while_the_admin_fixes_it)
+
+    [(_, page)] = serve.served
+    assert "youtube-helper" in page
+    assert sleep.durations == [timedelta(minutes=30)] * 3
+    assert (
+        caplog.text.count(
+            f"Media library {library} is not writable: No such file or directory;"
+            " skipping this cycle, trying again next cycle"
+        )
+        == 2
+    )
+    assert caplog.text.count("Cycle finished") == 1
 
 
-def test_daemon_exits_non_zero_when_media_library_becomes_unwritable_before_a_cycle(
+def test_daemon_carries_on_when_media_library_becomes_unwritable_before_a_cycle(
     media_library: Path, state_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO)
+    sleep = FakeSleep(stop_after=2)
 
     def sleep_while_library_disappears(seconds: float) -> None:
-        media_library.rmdir()
+        if media_library.exists():
+            media_library.rmdir()
+        sleep(seconds)
 
-    status = run_daemon(environment(media_library, state_dir), sleep=sleep_while_library_disappears)
+    with pytest.raises(StopDaemon):
+        run_daemon(environment(media_library, state_dir), sleep=sleep_while_library_disappears)
 
-    assert status != 0
     assert caplog.text.count("Cycle finished") == 1
     assert f"Media library {media_library} is not writable" in caplog.text
 

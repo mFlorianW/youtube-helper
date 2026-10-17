@@ -6,13 +6,13 @@
 
 import sqlite3
 import threading
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from youtube_helper.channels import Channel
 from youtube_helper.media_library import channel_folder
@@ -62,7 +62,25 @@ MIGRATIONS: tuple[str | Callable[[sqlite3.Connection], None], ...] = (
     # The owner's Google login is gone with Google: the Subscriptions are the tool's own now.
     "DROP TABLE login",
     "ALTER TABLE subscription ADD COLUMN details_refreshed TEXT",
+    "ALTER TABLE video ADD COLUMN gave_up TEXT",
+    # Close enough for the videos given up on before it was recorded; skipped ones have no time.
+    "UPDATE video SET gave_up = first_failure WHERE status = 'failed'",
+    "CREATE TABLE cycle_outcome ("
+    " id INTEGER PRIMARY KEY CHECK (id = 1),"
+    " started TEXT NOT NULL,"
+    " finished TEXT NOT NULL,"
+    " downloaded INTEGER NOT NULL,"
+    " unwritable TEXT,"
+    " free_space INTEGER,"
+    " free_space_threshold INTEGER,"
+    " failed_downloads INTEGER,"
+    " last_download_error TEXT,"
+    " bot_checks INTEGER)",
+    "CREATE TABLE feed_failure (channel_id TEXT PRIMARY KEY, error TEXT NOT NULL)",
 )
+
+# How long videos given up or skipped are still shown as problems.
+PROBLEM_WINDOW = timedelta(days=30)
 
 
 class StateUnavailable(Exception):
@@ -91,6 +109,55 @@ class TrackedSubscription:
     def tracks(self, upload: Upload) -> bool:
         """Whether `upload` is a New upload: released after the current tracking start."""
         return upload.released > self.tracking_start
+
+
+@dataclass(frozen=True)
+class LowSpace:
+    """Downloads paused: the Media library had only `free` bytes, less than `threshold`."""
+
+    free: int
+    threshold: int
+
+
+@dataclass(frozen=True)
+class AllDownloadsFailed:
+    """Every download a cycle attempted failed in yt-dlp, which is then likely outdated."""
+
+    attempts: int
+    last_error: str
+    bot_checks: int
+
+
+@dataclass(frozen=True)
+class CycleOutcome:
+    """What the last cycle did and the problems it found.
+
+    `unwritable` names the Media library and why it can't be written; the cycle was skipped then.
+    `feed_failures` holds, per channel ID, why that Subscription's feed couldn't be read.
+    """
+
+    started: datetime
+    finished: datetime
+    downloaded: int = 0
+    unwritable: str | None = None
+    low_space: LowSpace | None = None
+    all_downloads_failed: AllDownloadsFailed | None = None
+    feed_failures: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DownloadProblem:
+    """A video being retried since `first_failure`, given up on (`failed`) or `skipped` for good.
+
+    `gave_up` is when it was given up on or skipped; None while it is retried.
+    """
+
+    video_id: str
+    title: str
+    kind: Literal["retrying", "failed", "skipped"]
+    error: str
+    first_failure: datetime | None
+    gave_up: datetime | None
 
 
 class Subscribed(Enum):
@@ -270,12 +337,13 @@ class StateStore:
             "UPDATE video SET status = ? WHERE video_id = ?", (status, video_id)
         )
 
-    def mark_skipped(self, video_id: str, error: str) -> None:
+    def mark_skipped(self, video_id: str, error: str, at: datetime) -> None:
         """Remember that the video can never be downloaded, so it is never tried again."""
         with self._transaction() as connection:
             connection.execute(
-                "UPDATE video SET status = 'skipped', last_error = ? WHERE video_id = ?",
-                (error, video_id),
+                "UPDATE video SET status = 'skipped', last_error = ?, gave_up = ?"
+                " WHERE video_id = ?",
+                (error, _utc(at), video_id),
             )
 
     def record_failure(self, video_id: str, error: str, at: datetime) -> datetime:
@@ -284,14 +352,108 @@ class StateStore:
             (first_failure,) = connection.execute(
                 "UPDATE video SET last_error = ?, first_failure = COALESCE(first_failure, ?)"
                 " WHERE video_id = ? RETURNING first_failure",
-                (error, at.astimezone(UTC).isoformat(), video_id),
+                (error, _utc(at), video_id),
             ).fetchone()
         return datetime.fromisoformat(first_failure)
 
-    def mark_failed(self, video_id: str) -> None:
+    def mark_failed(self, video_id: str, at: datetime) -> None:
         """Remember that the video kept failing for too long, so it is never tried again."""
         with self._transaction() as connection:
-            connection.execute("UPDATE video SET status = 'failed' WHERE video_id = ?", (video_id,))
+            connection.execute(
+                "UPDATE video SET status = 'failed', gave_up = ? WHERE video_id = ?",
+                (_utc(at), video_id),
+            )
+
+    def download_problems(self, now: datetime) -> dict[str, list[DownloadProblem]]:
+        """The active Subscriptions' problem videos by channel ID, oldest first.
+
+        Those being retried, and those given up on or skipped within PROBLEM_WINDOW before `now`.
+        Excluded videos are no problem, nor are uploads left pending outside the tracking.
+        """
+        with self._transaction() as connection:
+            subscriptions = {
+                s.channel_id: s
+                for s in map(_tracked, connection.execute(_SELECT_SUBSCRIPTION + " WHERE active"))
+            }
+            rows = connection.execute(
+                "SELECT channel_id, video_id, title, released, status, last_error, first_failure,"
+                " gave_up FROM video"
+                " WHERE (status = 'pending' AND first_failure IS NOT NULL)"
+                " OR (status IN ('failed', 'skipped') AND gave_up >= ?)"
+                " ORDER BY released",
+                (_utc(now - PROBLEM_WINDOW),),
+            ).fetchall()
+        problems: dict[str, list[DownloadProblem]] = {}
+        for channel_id, video_id, title, released, status, error, first, gave_up in rows:
+            subscription = subscriptions.get(channel_id)
+            if subscription is None:
+                continue
+            upload = Upload(video_id, title, datetime.fromisoformat(released))
+            if status == "pending" and not subscription.tracks(upload):
+                continue
+            problems.setdefault(channel_id, []).append(
+                DownloadProblem(
+                    video_id,
+                    title,
+                    "retrying" if status == "pending" else status,
+                    error or "",
+                    _moment(first),
+                    _moment(gave_up),
+                )
+            )
+        return problems
+
+    def record_cycle(self, outcome: CycleOutcome) -> None:
+        """Remember `outcome` as the last cycle's, in place of the one before."""
+        failed = outcome.all_downloads_failed
+        low_space = outcome.low_space
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO cycle_outcome"
+                " (id, started, finished, downloaded, unwritable, free_space,"
+                " free_space_threshold, failed_downloads, last_download_error, bot_checks)"
+                " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _utc(outcome.started),
+                    _utc(outcome.finished),
+                    outcome.downloaded,
+                    outcome.unwritable,
+                    None if low_space is None else low_space.free,
+                    None if low_space is None else low_space.threshold,
+                    None if failed is None else failed.attempts,
+                    None if failed is None else failed.last_error,
+                    None if failed is None else failed.bot_checks,
+                ),
+            )
+            connection.execute("DELETE FROM feed_failure")
+            connection.executemany(
+                "INSERT INTO feed_failure (channel_id, error) VALUES (?, ?)",
+                outcome.feed_failures.items(),
+            )
+
+    def last_cycle(self) -> CycleOutcome | None:
+        """The outcome of the last cycle, or None if none has run yet."""
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT started, finished, downloaded, unwritable, free_space,"
+                " free_space_threshold, failed_downloads, last_download_error, bot_checks"
+                " FROM cycle_outcome"
+            ).fetchone()
+            feed_failures = dict(connection.execute("SELECT channel_id, error FROM feed_failure"))
+        if row is None:
+            return None
+        started, finished, downloaded, unwritable, free, threshold, attempts, error, bot_checks = (
+            row
+        )
+        return CycleOutcome(
+            datetime.fromisoformat(started),
+            datetime.fromisoformat(finished),
+            downloaded,
+            unwritable,
+            None if free is None else LowSpace(free, threshold),
+            None if attempts is None else AllDownloadsFailed(attempts, error, bot_checks),
+            feed_failures,
+        )
 
 
 _SELECT_SUBSCRIPTION = (
@@ -311,8 +473,16 @@ def _tracked(row: tuple[Any, ...]) -> TrackedSubscription:
         datetime.fromisoformat(start),
         description,
         avatar_url,
-        None if refreshed is None else datetime.fromisoformat(refreshed),
+        _moment(refreshed),
     )
+
+
+def _utc(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat()
+
+
+def _moment(stored: str | None) -> datetime | None:
+    return None if stored is None else datetime.fromisoformat(stored)
 
 
 def _migrate(connection: sqlite3.Connection) -> None:

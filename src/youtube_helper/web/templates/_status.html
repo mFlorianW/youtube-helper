@@ -1,0 +1,28 @@
+{#
+SPDX-FileCopyrightText: 2026 Florian Weßel <florianwessel@gmx.net>
+
+SPDX-License-Identifier: GPL-2.0-only
+#}
+
+<h2>Status</h2>
+{% if not outcome %}
+<p class="notice">No cycle has run yet.</p>
+{% else %}
+<p>Last cycle: {{ outcome.started | local_time }} to {{ outcome.finished | local_time }}, {{ outcome.downloaded }} New upload{{ "" if outcome.downloaded == 1 else "s" }} downloaded.</p>
+{% set failed = outcome.all_downloads_failed %}
+{% if outcome.unwritable %}
+<p class="notice error" role="alert">{{ outcome.unwritable }}; cycles are skipped until it is writable again.</p>
+{% endif %}
+{% if failed %}
+<p class="notice error" role="alert">
+  All downloads failing ({{ failed.attempts }} in the last cycle that tried any, last error: {{ failed.last_error }}): yt-dlp is likely outdated, pull the latest image.
+  {% if failed.bot_checks %}YouTube asked {{ failed.bot_checks }} of them for a bot check. {{ bot_check_advice }}.{% endif %}
+</p>
+{% endif %}
+{% if outcome.low_space %}
+<p class="notice error" role="alert">Only {{ outcome.low_space.free | size }} free in the Media library, less than {{ outcome.low_space.threshold | size }}: downloads are paused, New uploads stay pending until there is more room.</p>
+{% endif %}
+{% if not (outcome.unwritable or failed or outcome.low_space) %}
+<p class="notice">Nothing needs your attention.</p>
+{% endif %}
+{% endif %}

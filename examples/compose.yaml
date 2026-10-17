@@ -40,8 +40,8 @@ services:
       - "8080:8080"
     volumes:
       # adjust: host path of the Media library. Point your media server at the same path.
-      # It is checked for writability at startup and before every cycle; if it isn't
-      # writable, the daemon exits with an error naming the directory.
+      # It is checked for writability at startup and before every cycle; while it isn't
+      # writable, the daemon skips the cycles and the web UI names the directory.
       - /srv/media/youtube:/media-library:rw
       # adjust: host path for the state database (youtube-helper.sqlite3). Back it up;
       # losing it loses the Subscriptions.

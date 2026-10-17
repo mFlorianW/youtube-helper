@@ -17,6 +17,7 @@ from youtube_helper.media_library import (
     NFO_SUFFIX,
     POSTER,
     TVSHOW_NFO,
+    MediaLibraryUnwritable,
     ensure_writable,
     file_atomically,
     file_video,
@@ -25,7 +26,13 @@ from youtube_helper.media_library import (
     video_base,
 )
 from youtube_helper.nfo import episode_nfo, tvshow_nfo
-from youtube_helper.state import StateStore, TrackedSubscription
+from youtube_helper.state import (
+    AllDownloadsFailed,
+    CycleOutcome,
+    LowSpace,
+    StateStore,
+    TrackedSubscription,
+)
 from youtube_helper.upload_feed import FeedUnavailable, Upload, UploadFeed
 from youtube_helper.video_fetcher import (
     BotCheck,
@@ -76,38 +83,72 @@ class Cycle:
         self._free_space = free_space
 
     def run(self) -> None:
-        """Run one cycle.
+        """Run one cycle and record its outcome in the state store.
 
-        Raises MediaLibraryUnwritable before doing anything if the Media library can't be written.
+        The cycle is skipped, and only that recorded, if the Media library can't be written.
+        A warning the cycle didn't look into stays as the cycle before recorded it.
         """
-        ensure_writable(self._media_library)
+        started = self._clock()
+        previous = self._state.last_cycle() or CycleOutcome(started, started)
+        try:
+            ensure_writable(self._media_library)
+        except MediaLibraryUnwritable as error:
+            log.error("%s; skipping this cycle, trying again next cycle", error)
+            self._state.record_cycle(
+                replace(
+                    previous,
+                    started=started,
+                    finished=self._clock(),
+                    downloaded=0,
+                    unwritable=str(error),
+                )
+            )
+            return
         log.info("Cycle started")
         subscriptions = [self._refresh_details(s) for s in self._active_subscriptions()]
+        feed_failures = {}
         for subscription in subscriptions:
-            self._detect_new_uploads(subscription)
+            if (failure := self._detect_new_uploads(subscription)) is not None:
+                feed_failures[subscription.channel_id] = failure
         downloads = _Downloads()
-        self._download_new_uploads(subscriptions, downloads)
+        low_space = self._download_new_uploads(subscriptions, downloads)
         downloads.report_retries()
         for subscription in subscriptions:
             self._complete_channel_folder(subscription)
+        self._state.record_cycle(
+            CycleOutcome(
+                started,
+                self._clock(),
+                downloads.downloaded,
+                low_space=low_space,
+                # Without a download attempt there is nothing to judge yt-dlp by.
+                all_downloads_failed=downloads.all_failed()
+                if downloads.attempts
+                else previous.all_downloads_failed,
+                feed_failures=feed_failures,
+            )
+        )
         log.info("Cycle finished")
 
-    def _enough_free_space(self) -> bool:
-        """Whether there is room for the next download; logs why not when there isn't."""
+    def _low_space(self) -> LowSpace | None:
+        """Why there is no room for the next download, logged; None if there is room."""
         free = self._free_space(self._media_library)
         if free >= MIN_FREE_SPACE:
-            return True
+            return None
         log.warning(
             "Only %s free in the Media library %s, less than %s; "
             "no more downloads this cycle, New uploads stay pending",
-            _format_size(free),
+            format_size(free),
             self._media_library,
-            _format_size(MIN_FREE_SPACE),
+            format_size(MIN_FREE_SPACE),
         )
-        return False
+        return LowSpace(free, MIN_FREE_SPACE)
 
-    def _detect_new_uploads(self, subscription: TrackedSubscription) -> None:
-        """Remember the uploads released after the Subscription's tracking start."""
+    def _detect_new_uploads(self, subscription: TrackedSubscription) -> str | None:
+        """Remember the uploads released after the Subscription's tracking start.
+
+        Returns why the Subscription's feed can't be read, if it can't.
+        """
         try:
             uploads = self._feed.uploads(subscription.channel_id)
         except FeedUnavailable as error:
@@ -116,24 +157,32 @@ class Cycle:
                 subscription.display_name,
                 error,
             )
-            return
+            return str(error)
         self._state.record_uploads(
             subscription.channel_id,
             (u for u in uploads if subscription.tracks(u)),
         )
+        return None
 
     def _download_new_uploads(
         self, subscriptions: list[TrackedSubscription], downloads: _Downloads
-    ) -> None:
+    ) -> LowSpace | None:
+        """Download the pending New uploads while there is room; returns why not once there isn't.
+
+        Free space is checked even with nothing to download, so a full disk is always noticed.
+        """
+        if (low_space := self._low_space()) is not None:
+            return low_space
         for subscription in subscriptions:
             for upload in self._state.pending_uploads(subscription.channel_id):
                 # Uploads left pending before an unsubscribe fall into the gap: never fetched.
                 if not subscription.tracks(upload):
                     continue
                 # Checked before every download, as each one eats into the free space.
-                if not self._enough_free_space():
-                    return
+                if (low_space := self._low_space()) is not None:
+                    return low_space
                 self._download(subscription, upload, downloads)
+        return None
 
     def _download(
         self, subscription: TrackedSubscription, upload: Upload, downloads: _Downloads
@@ -170,7 +219,7 @@ class Cycle:
             )
             downloads.not_attempted()
         except VideoUnavailable as error:
-            self._state.mark_skipped(upload.video_id, str(error))
+            self._state.mark_skipped(upload.video_id, str(error), self._clock())
             log.warning("Skipped %s (%s) for good: %s", upload.title, upload.video_id, error)
         except (FetchFailed, OSError) as error:
             self._retry_later(upload, error, downloads)
@@ -178,6 +227,7 @@ class Cycle:
             self._state.mark_downloaded(
                 upload.video_id, subscription.channel_id, aired.year, episode
             )
+            downloads.downloaded += 1
             log.info("Downloaded %s", base.relative_to(self._media_library))
 
     def _retry_later(self, upload: Upload, error: Exception, downloads: _Downloads) -> None:
@@ -185,7 +235,7 @@ class Cycle:
         now = self._clock()
         first_failure = self._state.record_failure(upload.video_id, str(error), now)
         if now - first_failure >= RETRY_PERIOD:
-            self._state.mark_failed(upload.video_id)
+            self._state.mark_failed(upload.video_id, now)
             log.error(
                 "Gave up on %s (%s) after failing for %d hours: %s",
                 upload.title,
@@ -283,37 +333,44 @@ class _Failure:
 
 @dataclass
 class _Downloads:
-    """The download attempts of one cycle and those that failed, not for good: retried or given up.
+    """The download attempts of one cycle, those that succeeded and those that failed, not for
+    good: retried or given up.
 
     Tells a broken yt-dlp from videos that fail on their own.
     """
 
     attempts: int = 0
+    downloaded: int = 0
     failures: list[_Failure] = field(default_factory=list)
 
     def not_attempted(self) -> None:
         """Take back the last attempt: the video isn't to be downloaded (yet), nothing failed."""
         self.attempts -= 1
 
-    def _yt_dlp_broken(self) -> bool:
-        """Whether every download attempt failed, and in yt-dlp: not writing the Media library."""
-        return (
+    def all_failed(self) -> AllDownloadsFailed | None:
+        """How every download attempt failed in yt-dlp, not writing the Media library, if so."""
+        if not (
             self.attempts > 0
             and len(self.failures) == self.attempts
             and all(isinstance(f.error, FetchFailed) for f in self.failures)
+        ):
+            return None
+        return AllDownloadsFailed(
+            self.attempts,
+            str(self.failures[-1].error),
+            sum(isinstance(f.error, BotCheck) for f in self.failures),
         )
 
     def report_retries(self) -> None:
         """Log each download to be retried, or one message if every download failed."""
-        if self._yt_dlp_broken():
-            bot_checks = sum(isinstance(f.error, BotCheck) for f in self.failures)
+        if (failed := self.all_failed()) is not None:
             log.error(
                 "All downloads failing (%d this cycle, last error: %s); yt-dlp is likely"
                 " outdated, pull the latest image%s",
-                self.attempts,
-                self.failures[-1].error,
-                f". YouTube asked {bot_checks} of them for a bot check. {BOT_CHECK_ADVICE}"
-                if bot_checks
+                failed.attempts,
+                failed.last_error,
+                f". YouTube asked {failed.bot_checks} of them for a bot check. {BOT_CHECK_ADVICE}"
+                if failed.bot_checks
                 else "",
             )
             return
@@ -341,5 +398,6 @@ def _format_time(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _format_size(size: int) -> str:
+def format_size(size: int) -> str:
+    """`size` bytes in GiB, as the free space is told."""
     return f"{size / GIB:.1f} GiB"

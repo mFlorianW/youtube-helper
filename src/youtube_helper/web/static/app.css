@@ -77,6 +77,30 @@ h2 {
   overflow: hidden;
 }
 
+.problems {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.875rem;
+  color: var(--pico-del-color);
+}
+
+.problems li {
+  margin-bottom: 0.15rem;
+}
+
+.problems .retrying {
+  color: var(--pico-muted-color);
+}
+
+.channel .details .problems a {
+  font-weight: 400;
+  text-decoration: underline;
+}
+
+#status p:last-child {
+  margin-bottom: 0;
+}
+
 .channel form {
   margin: 0;
 }

@@ -15,6 +15,23 @@ SPDX-License-Identifier: GPL-2.0-only
     <div class="details">
       <a href="https://www.youtube.com/channel/{{ subscription.channel_id }}" target="_blank" rel="noopener noreferrer"><span class="channel-name">{{ subscription.display_name }}</span></a>
       <small>Tracking since {{ subscription.tracking_start | local_time }}</small>
+      {% set feed_failure = outcome.feed_failures.get(subscription.channel_id) if outcome else none %}
+      {% set channel_problems = problems.get(subscription.channel_id, []) %}
+      {% if feed_failure or channel_problems %}
+      <ul class="problems">
+        {% if feed_failure %}
+        <li>Couldn't read the channel's feed in the last cycle ({{ feed_failure }}); trying again next cycle.</li>
+        {% endif %}
+        {% for problem in channel_problems %}
+        {% set video_link %}<a href="https://www.youtube.com/watch?v={{ problem.video_id }}" target="_blank" rel="noopener noreferrer">{{ problem.title }}</a>{% endset %}
+        <li class="{{ problem.kind }}">
+          {% if problem.kind == "retrying" %}Retrying {{ video_link }}: {{ problem.error }} (failing since {{ problem.first_failure | local_time }})
+          {% elif problem.kind == "failed" %}Gave up on {{ video_link }} on {{ problem.gave_up | local_time }} after {{ retry_hours }} hours: {{ problem.error }}
+          {% else %}Skipped {{ video_link }} for good on {{ problem.gave_up | local_time }}: {{ problem.error }}{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
     </div>
     <form method="post" action="/subscriptions/{{ subscription.channel_id }}/remove"
           hx-post="/subscriptions/{{ subscription.channel_id }}/remove" hx-target="#subscriptions"
